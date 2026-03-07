@@ -16,6 +16,132 @@ Enable **OpenAI Codex CLI** to work with **GLM (智谱 AI)** models by running a
 - ✅ **Automatic Model Mapping** - Maps OpenAI model names to GLM equivalents
 - ✅ **Easy Setup** - Single Python file, no complex dependencies
 
+## 📊 Use Cases
+
+### 🎯 Perfect For
+
+- **Chinese Developers** - Use GLM (智谱 AI) instead of OpenAI GPT-4
+- **Cost-Conscious Teams** - GLM offers competitive pricing for Chinese users
+- **Local Development** - Run Codex with domestic LLM providers
+- **Privacy-Focused Projects** - Keep code within China's borders
+- **Learning & Education** - Access powerful coding AI without OpenAI account
+
+### 💡 Common Scenarios
+
+| Scenario | Example Command |
+|----------|----------------|
+| **Quick Prototyping** | `codex exec "Create a REST API with authentication"` |
+| **Code Generation** | `codex exec "Generate TypeScript interfaces from JSON schema"` |
+| **Bug Fixing** | `codex exec "Fix the null pointer exception in UserService.java"` |
+| **Testing** | `codex exec "Add unit tests for the calculator module"` |
+| **Documentation** | `codex exec "Generate API documentation from code comments"` |
+| **Refactoring** | `codex exec "Refactor this class to use dependency injection"` |
+
+## 🔄 Architecture & Data Flow
+
+### System Architecture
+
+```
+┌─────────────────┐
+│   Codex CLI     │  User runs: codex exec "task"
+│   (User Side)   │
+└────────┬────────┘
+         │ OpenAI Responses API Format
+         ▼
+┌─────────────────────────────────────────┐
+│   Codex GLM Proxy (localhost:18765)    │
+│                                          │
+│  ┌────────────────────────────────────┐ │
+│  │  Request Converter                 │ │
+│  │  - Responses → Chat Completions    │ │
+│  │  - Tool call history handling      │ │
+│  │  - Model name mapping              │ │
+│  └────────────────────────────────────┘ │
+│                                          │
+│  ┌────────────────────────────────────┐ │
+│  │  Response Converter                │ │
+│  │  - Chat → Responses API streaming  │ │
+│  │  - Tool call streaming             │ │
+│  │  - Event sequencing                │ │
+│  └────────────────────────────────────┘ │
+└────────┬────────────────────────────────┘
+         │ GLM Chat Completions API Format
+         ▼
+┌─────────────────┐
+│   GLM API       │  https://open.bigmodel.cn/api/coding/paas/v4
+│   (智谱 AI)     │
+└─────────────────┘
+```
+
+### Request Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant C as Codex CLI
+    participant P as GLM Proxy
+    participant G as GLM API
+
+    U->>C: codex exec "Create hello.py"
+    C->>P: POST /v4/chat/completions<br/>(Responses API format)
+    Note over P: Convert to Chat Completions
+    P->>G: POST /chat/completions<br/>(GLM format)
+    G-->>P: Streaming response
+    Note over P: Convert back to Responses API
+    P-->>C: Streaming events
+    C-->>U: Display results & apply changes
+```
+
+### Key Conversion Points
+
+**1. Request Conversion (Codex → GLM)**
+```json
+// OpenAI Responses API (from Codex)
+{
+  "model": "gpt-4o",
+  "input": [
+    {"type": "message", "role": "user", "content": "..."},
+    {"type": "function_call", "call_id": "...", "name": "exec"}
+  ]
+}
+
+        ⬇️ Proxy Converts ⬇️
+
+// GLM Chat Completions (to GLM)
+{
+  "model": "glm-4-plus",
+  "messages": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "tool_calls": [...]}
+  ],
+  "tools": [...]
+}
+```
+
+**2. Response Conversion (GLM → Codex)**
+```
+GLM Stream Chunk          →  Codex Event
+────────────────────         ────────────────
+delta.content            →  response.output_text.delta
+delta.tool_calls         →  response.function_call_arguments.delta
+finish_reason            →  response.completed
+```
+
+### Tool Call Flow
+
+```mermaid
+graph LR
+    A[Codex Request] --> B[Proxy]
+    B --> C{Tool Call?}
+    C -->|Yes| D[Execute Tool]
+    D --> E[Return Result]
+    E --> B
+    C -->|No| F[Stream to GLM]
+    F --> G[Get Response]
+    G --> H[Convert & Return]
+    H --> A
+```
+
 ## 🚀 Quick Start
 
 ### Prerequisites

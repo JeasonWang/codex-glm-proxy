@@ -16,6 +16,132 @@
 - ✅ **自动模型映射** - 自动将 OpenAI 模型名映射到 GLM 对应版本
 - ✅ **简单配置** - 单个 Python 文件，无需复杂依赖
 
+## 📊 使用场景
+
+### 🎯 适用人群
+
+- **中国开发者** - 使用国产 GLM 替代 OpenAI GPT-4
+- **成本敏感团队** - GLM 为中国用户提供有竞争力的价格
+- **本地化开发** - 使用国内 LLM 提供商运行 Codex
+- **隐私优先项目** - 将代码保留在中国境内
+- **学习与教育** - 无需 OpenAI 账号即可使用强大的编程 AI
+
+### 💡 常见场景
+
+| 场景 | 示例命令 |
+|------|----------|
+| **快速原型** | `codex exec "创建一个带认证的 REST API"` |
+| **代码生成** | `codex exec "从 JSON schema 生成 TypeScript 接口"` |
+| **Bug 修复** | `codex exec "修复 UserService.java 中的空指针异常"` |
+| **编写测试** | `codex exec "为计算器模块添加单元测试"` |
+| **文档生成** | `codex exec "从代码注释生成 API 文档"` |
+| **代码重构** | `codex exec "重构这个类以使用依赖注入"` |
+
+## 🔄 架构与数据流
+
+### 系统架构
+
+```
+┌─────────────────┐
+│   Codex CLI     │  用户运行: codex exec "任务"
+│   (用户端)      │
+└────────┬────────┘
+         │ OpenAI Responses API 格式
+         ▼
+┌─────────────────────────────────────────┐
+│   Codex GLM 代理 (localhost:18765)     │
+│                                          │
+│  ┌────────────────────────────────────┐ │
+│  │  请求转换器                        │ │
+│  │  - Responses → Chat Completions    │ │
+│  │  - 工具调用历史处理                │ │
+│  │  - 模型名映射                      │ │
+│  └────────────────────────────────────┘ │
+│                                          │
+│  ┌────────────────────────────────────┐ │
+│  │  响应转换器                        │ │
+│  │  - Chat → Responses API 流式       │ │
+│  │  - 工具调用流式传输                │ │
+│  │  - 事件排序                        │ │
+│  └────────────────────────────────────┘ │
+└────────┬────────────────────────────────┘
+         │ GLM Chat Completions API 格式
+         ▼
+┌─────────────────┐
+│   GLM API       │  https://open.bigmodel.cn/api/coding/paas/v4
+│   (智谱 AI)     │
+└─────────────────┘
+```
+
+### 请求流程
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant C as Codex CLI
+    participant P as GLM 代理
+    participant G as GLM API
+
+    U->>C: codex exec "创建 hello.py"
+    C->>P: POST /v4/chat/completions<br/>(Responses API 格式)
+    Note over P: 转换为 Chat Completions
+    P->>G: POST /chat/completions<br/>(GLM 格式)
+    G-->>P: 流式响应
+    Note over P: 转换回 Responses API
+    P-->>C: 流式事件
+    C-->>U: 显示结果并应用更改
+```
+
+### 关键转换点
+
+**1. 请求转换（Codex → GLM）**
+```json
+// OpenAI Responses API（来自 Codex）
+{
+  "model": "gpt-4o",
+  "input": [
+    {"type": "message", "role": "user", "content": "..."},
+    {"type": "function_call", "call_id": "...", "name": "exec"}
+  ]
+}
+
+        ⬇️ 代理转换 ⬇️
+
+// GLM Chat Completions（发送给 GLM）
+{
+  "model": "glm-4-plus",
+  "messages": [
+    {"role": "user", "content": "..."},
+    {"role": "assistant", "tool_calls": [...]}
+  ],
+  "tools": [...]
+}
+```
+
+**2. 响应转换（GLM → Codex）**
+```
+GLM 流式块               →  Codex 事件
+────────────────────        ────────────────
+delta.content           →  response.output_text.delta
+delta.tool_calls        →  response.function_call_arguments.delta
+finish_reason           →  response.completed
+```
+
+### 工具调用流程
+
+```mermaid
+graph LR
+    A[Codex 请求] --> B[代理]
+    B --> C{需要工具调用?}
+    C -->|是| D[执行工具]
+    D --> E[返回结果]
+    E --> B
+    C -->|否| F[流式传输到 GLM]
+    F --> G[获取响应]
+    G --> H[转换并返回]
+    H --> A
+```
+
 ## 🚀 快速开始
 
 ### 前置要求
