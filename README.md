@@ -3,6 +3,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
+**English** | [中文](README_CN.md)
+
 Enable **OpenAI Codex CLI** to work with **GLM (智谱 AI)** models by running a local proxy that converts OpenAI Responses API format to GLM Chat Completions format.
 
 ## ✨ Features
@@ -26,7 +28,7 @@ Enable **OpenAI Codex CLI** to work with **GLM (智谱 AI)** models by running a
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/yourusername/codex-glm-proxy.git
+   git clone https://github.com/JichinX/codex-glm-proxy.git
    cd codex-glm-proxy
    ```
 
