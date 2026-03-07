@@ -43,33 +43,33 @@
 
 ```
 ┌─────────────────┐
-│   Codex CLI     │  用户运行: codex exec "任务"
-│   (用户端)      │
+│   Codex CLI     │  发送: Responses API 请求
+│   (用户端)      │  接收: Responses API 响应
 └────────┬────────┘
-         │ OpenAI Responses API 格式
+         │ Responses API 格式
          ▼
 ┌─────────────────────────────────────────┐
 │   Codex GLM 代理 (localhost:18765)     │
 │                                          │
 │  ┌────────────────────────────────────┐ │
 │  │  请求转换器                        │ │
-│  │  - Responses → Chat Completions    │ │
+│  │  - Responses API → Chat Completions│ │
 │  │  - 工具调用历史处理                │ │
 │  │  - 模型名映射                      │ │
 │  └────────────────────────────────────┘ │
 │                                          │
 │  ┌────────────────────────────────────┐ │
 │  │  响应转换器                        │ │
-│  │  - Chat → Responses API 流式       │ │
+│  │  - Chat Completions → Responses API│ │
 │  │  - 工具调用流式传输                │ │
 │  │  - 事件排序                        │ │
 │  └────────────────────────────────────┘ │
 └────────┬────────────────────────────────┘
-         │ GLM Chat Completions API 格式
+         │ Chat Completions API 格式
          ▼
 ┌─────────────────┐
-│   GLM API       │  https://open.bigmodel.cn/api/coding/paas/v4
-│   (智谱 AI)     │
+│   GLM API       │  发送: Chat Completions 请求
+│   (智谱 AI)     │  接收: Chat Completions 响应
 └─────────────────┘
 ```
 
@@ -83,12 +83,12 @@ sequenceDiagram
     participant G as GLM API
 
     U->>C: codex exec "创建 hello.py"
-    C->>P: POST /v4/chat/completions<br/>(Responses API 格式)
-    Note over P: 转换为 Chat Completions
-    P->>G: POST /chat/completions<br/>(GLM 格式)
-    G-->>P: 流式响应
+    C->>P: Responses API 请求<br/>(Responses API 格式)
+    Note over P: 转换为 Chat Completions API
+    P->>G: Chat Completions 请求<br/>(GLM 格式)
+    G-->>P: Chat Completions 响应<br/>(流式)
     Note over P: 转换回 Responses API
-    P-->>C: 流式事件
+    P-->>C: Responses API 响应<br/>(流式事件)
     C-->>U: 显示结果并应用更改
 ```
 
@@ -120,12 +120,14 @@ sequenceDiagram
 
 **2. 响应转换（GLM → Codex）**
 ```
-GLM 流式块               →  Codex 事件
-────────────────────        ────────────────
+GLM Chat Completions     →  Responses API 事件
+────────────────────         ────────────────────────
 delta.content           →  response.output_text.delta
 delta.tool_calls        →  response.function_call_arguments.delta
 finish_reason           →  response.completed
 ```
+
+**注意：** Codex CLI 发送和接收的是 **Responses API 格式**，而 GLM API 使用的是 **Chat Completions 格式**。代理负责双向转换。
 
 ### 工具调用流程
 

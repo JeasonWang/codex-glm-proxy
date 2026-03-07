@@ -43,33 +43,33 @@ Enable **OpenAI Codex CLI** to work with **GLM (智谱 AI)** models by running a
 
 ```
 ┌─────────────────┐
-│   Codex CLI     │  User runs: codex exec "task"
-│   (User Side)   │
+│   Codex CLI     │  Sends: Responses API Request
+│   (User Side)   │  Receives: Responses API Response
 └────────┬────────┘
-         │ OpenAI Responses API Format
+         │ Responses API Format
          ▼
 ┌─────────────────────────────────────────┐
 │   Codex GLM Proxy (localhost:18765)    │
 │                                          │
 │  ┌────────────────────────────────────┐ │
 │  │  Request Converter                 │ │
-│  │  - Responses → Chat Completions    │ │
+│  │  - Responses API → Chat Completions│ │
 │  │  - Tool call history handling      │ │
 │  │  - Model name mapping              │ │
 │  └────────────────────────────────────┘ │
 │                                          │
 │  ┌────────────────────────────────────┐ │
 │  │  Response Converter                │ │
-│  │  - Chat → Responses API streaming  │ │
+│  │  - Chat Completions → Responses API│ │
 │  │  - Tool call streaming             │ │
 │  │  - Event sequencing                │ │
 │  └────────────────────────────────────┘ │
 └────────┬────────────────────────────────┘
-         │ GLM Chat Completions API Format
+         │ Chat Completions API Format
          ▼
 ┌─────────────────┐
-│   GLM API       │  https://open.bigmodel.cn/api/coding/paas/v4
-│   (智谱 AI)     │
+│   GLM API       │  Sends: Chat Completions Request
+│   (智谱 AI)     │  Receives: Chat Completions Response
 └─────────────────┘
 ```
 
@@ -83,12 +83,12 @@ sequenceDiagram
     participant G as GLM API
 
     U->>C: codex exec "Create hello.py"
-    C->>P: POST /v4/chat/completions<br/>(Responses API format)
-    Note over P: Convert to Chat Completions
-    P->>G: POST /chat/completions<br/>(GLM format)
-    G-->>P: Streaming response
+    C->>P: Responses API Request<br/>(Responses API format)
+    Note over P: Convert to Chat Completions API
+    P->>G: Chat Completions Request<br/>(GLM format)
+    G-->>P: Chat Completions Response<br/>(Streaming)
     Note over P: Convert back to Responses API
-    P-->>C: Streaming events
+    P-->>C: Responses API Response<br/>(Streaming events)
     C-->>U: Display results & apply changes
 ```
 
@@ -120,12 +120,14 @@ sequenceDiagram
 
 **2. Response Conversion (GLM → Codex)**
 ```
-GLM Stream Chunk          →  Codex Event
-────────────────────         ────────────────
+GLM Chat Completions     →  Responses API Event
+────────────────────         ────────────────────────
 delta.content            →  response.output_text.delta
 delta.tool_calls         →  response.function_call_arguments.delta
 finish_reason            →  response.completed
 ```
+
+**Note:** Codex CLI sends and receives **Responses API format**, while GLM API uses **Chat Completions format**. The proxy handles the bidirectional conversion.
 
 ### Tool Call Flow
 
