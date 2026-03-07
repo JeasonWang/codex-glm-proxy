@@ -1,0 +1,17 @@
+# Codex Configuration Example for GLM Proxy
+# Copy this file to ~/.codex/config.toml
+
+model_provider = "glm-proxy"
+model = "gpt-4o"  # Will be mapped to glm-4-plus
+
+[model_providers.glm-proxy]
+name = "GLM via Proxy"
+base_url = "http://localhost:18765/v4"
+wire_api = "responses"
+
+# Optional: Set approval mode
+# approval = "never"  # or "suggest" or "auto"
+
+# Optional: Configure sandbox
+# [sandbox]
+# permissions = ["workspace-write", "network"]
