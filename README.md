@@ -236,6 +236,30 @@ tail -f codex-glm-proxy.log
 ./scripts/stop.sh
 ```
 
+### 🔄 Auto-start on Boot (macOS)
+
+1. **Create `.env` file** in project root:
+   ```bash
+   echo 'GLM_API_KEY=your_api_key_here' > .env
+   ```
+
+2. **Install launchd service**:
+   ```bash
+   cp com.codex-glm-proxy.plist ~/Library/LaunchAgents/
+   launchctl load ~/Library/LaunchAgents/com.codex-glm-proxy.plist
+   ```
+
+3. **Manage the service**:
+   ```bash
+   # Stop & disable auto-start
+   launchctl unload ~/Library/LaunchAgents/com.codex-glm-proxy.plist
+
+   # Start & enable auto-start
+   launchctl load ~/Library/LaunchAgents/com.codex-glm-proxy.plist
+   ```
+
+The service will auto-start on login and auto-restart on crash. Logs are written to `codex-glm-proxy.log` in the project directory.
+
 ## 🛠️ How It Works
 
 The proxy sits between Codex CLI and GLM API, converting:

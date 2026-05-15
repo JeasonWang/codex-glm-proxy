@@ -238,6 +238,30 @@ tail -f codex-glm-proxy.log
 ./scripts/stop.sh
 ```
 
+### 🔄 开机自启（macOS）
+
+1. **创建 `.env` 文件**（项目根目录）：
+   ```bash
+   echo 'GLM_API_KEY=你的API密钥' > .env
+   ```
+
+2. **安装 launchd 服务**：
+   ```bash
+   cp com.codex-glm-proxy.plist ~/Library/LaunchAgents/
+   launchctl load ~/Library/LaunchAgents/com.codex-glm-proxy.plist
+   ```
+
+3. **管理服务**：
+   ```bash
+   # 停止并取消自启
+   launchctl unload ~/Library/LaunchAgents/com.codex-glm-proxy.plist
+
+   # 启动并恢复自启
+   launchctl load ~/Library/LaunchAgents/com.codex-glm-proxy.plist
+   ```
+
+服务会在登录时自动启动，崩溃后自动重启。日志写入项目目录下的 `codex-glm-proxy.log`。
+
 ## 🛠️ 工作原理
 
 代理位于 Codex CLI 和 GLM API 之间，进行格式转换：
