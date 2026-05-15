@@ -165,10 +165,15 @@ graph LR
    export GLM_API_KEY="your_glm_api_key_here"
    ```
 
-3. **Start the proxy**
+3. **Install dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Start the proxy**
    ```bash
    python3 proxy.py
-   # 或使用便捷脚本
+   # Or use the convenience script
    ./scripts/start.sh
    ```
 
@@ -187,13 +192,11 @@ graph LR
    wire_api = "responses"
    ```
 
-5. **Test it!**
+6. **Test it!**
    ```bash
    mkdir test-codex && cd test-codex && git init
    codex exec "Create a Python hello world program" --full-auto
    ```
-
-## 📋 Configuration
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
@@ -209,10 +212,11 @@ The proxy automatically maps OpenAI model names to GLM equivalents:
 |--------------|-----------|-------|
 | `gpt-4` | `glm-4` | Standard GPT-4 |
 | `gpt-4-turbo` | `glm-4` | GPT-4 Turbo |
-| `gpt-4o` | `glm-4-plus` | **Recommended** for best coding |
+| `gpt-4o` | `glm-5` | **Recommended** for best coding |
 | `gpt-4o-mini` | `glm-4-flash` | Faster, cheaper |
 | `gpt-3.5-turbo` | `glm-4-flash` | Legacy support |
 | `gpt-5.x-codex` | `glm-5` | Future Codex models |
+| `glm-5.1` | `glm-5.1` | Direct GLM model |
 
 **Recommendation:** Use `model = "gpt-4o"` in your Codex config for best results.
 
@@ -226,7 +230,7 @@ The proxy automatically maps OpenAI model names to GLM equivalents:
 curl http://localhost:18765/health
 
 # View logs
-tail -f /tmp/codex-glm-proxy.log
+tail -f codex-glm-proxy.log
 
 # Stop proxy
 ./scripts/stop.sh
@@ -275,7 +279,7 @@ codex exec "Create a calculator module with unit tests" --full-auto
 
 ### 502 Bad Gateway
 **Cause:** Proxy crashed  
-**Solution:** Check logs at `/tmp/codex-glm-proxy.log` and restart
+**Solution:** Check logs at `codex-glm-proxy.log` and restart
 
 ### Connection refused
 **Cause:** Proxy not running  

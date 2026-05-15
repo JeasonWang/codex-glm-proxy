@@ -1,7 +1,9 @@
 #!/bin/bash
 # Stop Codex GLM Proxy
 
-PID_FILE="/tmp/codex-glm-proxy.pid"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PID_FILE="$PROJECT_DIR/codex-glm-proxy.pid"
 
 if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
@@ -15,8 +17,8 @@ if [ -f "$PID_FILE" ]; then
         rm -f "$PID_FILE"
     fi
 else
-    # Try to find and kill by process name
-    PID=$(pgrep -f "codex-glm-proxy/scripts/proxy.py" | head -1)
+    # Try to find and kill by port
+    PID=$(lsof -ti:18765 2>/dev/null | head -1)
     if [ -n "$PID" ]; then
         echo "Stopping proxy (PID: $PID)..."
         kill "$PID"

@@ -2,10 +2,9 @@
 # Start Codex GLM Proxy
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG_FILE="/tmp/codex-glm-proxy.log"
-PID_FILE="/tmp/codex-glm-proxy.pid"
-
-echo "SCRIPT_DIR: $SCRIPT_DIR"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+LOG_FILE="$PROJECT_DIR/codex-glm-proxy.log"
+PID_FILE="$PROJECT_DIR/codex-glm-proxy.pid"
 
 # Check if already running
 if [ -f "$PID_FILE" ]; then
@@ -23,9 +22,18 @@ if [ -z "$GLM_API_KEY" ]; then
     exit 1
 fi
 
+# Check for aiohttp dependency
+python3 -c "import aiohttp" 2>/dev/null || {
+    echo "Installing aiohttp..."
+    pip3 install -r "$PROJECT_DIR/requirements.txt" || {
+        echo "Error: Failed to install aiohttp"
+        exit 1
+    }
+}
+
 # Start proxy
 echo "Starting Codex GLM Proxy..."
-nohup python3 "$SCRIPT_DIR/../proxy.py" > "$LOG_FILE" 2>&1 &
+nohup python3 "$PROJECT_DIR/proxy.py" > "$LOG_FILE" 2>&1 &
 PID=$!
 echo $PID > "$PID_FILE"
 sleep 1
@@ -33,7 +41,7 @@ sleep 1
 # Verify
 if curl -s http://localhost:18765/health > /dev/null 2>&1; then
     echo "✓ Proxy started successfully (PID: $PID)"
-    echo "  Health check: http://localhost:8765/health"
+    echo "  Health check: http://localhost:18765/health"
     echo "  Log file: $LOG_FILE"
 else
     echo "✗ Proxy failed to start. Check log: $LOG_FILE"

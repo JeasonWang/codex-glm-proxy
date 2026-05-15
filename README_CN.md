@@ -165,7 +165,12 @@ graph LR
    export GLM_API_KEY="你的_GLM_API_密钥"
    ```
 
-3. **启动代理**
+3. **安装依赖**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **启动代理**
    ```bash
    python3 proxy.py
    # 或使用便捷脚本
@@ -187,7 +192,7 @@ graph LR
    wire_api = "responses"
    ```
 
-5. **测试**
+6. **测试**
    ```bash
    mkdir test-codex && cd test-codex && git init
    codex exec "创建一个 Python hello world 程序" --full-auto
@@ -209,10 +214,11 @@ graph LR
 |------------|----------|------|
 | `gpt-4` | `glm-4` | 标准 GPT-4 |
 | `gpt-4-turbo` | `glm-4` | GPT-4 Turbo |
-| `gpt-4o` | `glm-4-plus` | **推荐**，最佳编码体验 |
+| `gpt-4o` | `glm-5` | **推荐**，最佳编码体验 |
 | `gpt-4o-mini` | `glm-4-flash` | 更快、更便宜 |
 | `gpt-3.5-turbo` | `glm-4-flash` | 旧版支持 |
 | `gpt-5.x-codex` | `glm-5` | 未来 Codex 模型 |
+| `glm-5.1` | `glm-5.1` | 直接使用 GLM 模型 |
 
 **建议：** 在 Codex 配置中使用 `model = "gpt-4o"` 以获得最佳效果。
 
@@ -226,7 +232,7 @@ graph LR
 curl http://localhost:18765/health
 
 # 查看日志
-tail -f /tmp/codex-glm-proxy.log
+tail -f codex-glm-proxy.log
 
 # 停止代理
 ./scripts/stop.sh
@@ -275,7 +281,7 @@ codex exec "创建一个计算器模块并编写单元测试" --full-auto
 
 ### 502 Bad Gateway
 **原因：** 代理崩溃  
-**解决：** 检查日志 `/tmp/codex-glm-proxy.log` 并重启
+**解决：** 检查日志 `codex-glm-proxy.log` 并重启
 
 ### Connection refused
 **原因：** 代理未运行  

@@ -4,120 +4,107 @@ OpenAI Responses API -> GLM Chat Completions API Proxy
 
 Converts the new Responses API format to the traditional Chat Completions format
 so that Codex can work with GLM (智谱 AI) models.
+
+Powered by aiohttp for high-performance async I/O with connection pooling.
 """
 
+import asyncio
 import json
-import http.server
-import socketserver
-import http.client
-import urllib.request
-import urllib.error
-import urllib.parse
+import logging
 import os
 import sys
-import logging
 
-# Unbuffered stdout for logging
-sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+import aiohttp
+from aiohttp import web
 
 # Configuration
 GLM_API_BASE = os.environ.get("GLM_API_BASE", "https://open.bigmodel.cn/api/coding/paas/v4")
 GLM_API_KEY = os.environ.get("GLM_API_KEY", "")
-PROXY_PORT = int(os.environ.get("PROXY_PORT", 18765))
+try:
+    PROXY_PORT = int(os.environ.get("PROXY_PORT", 18765))
+except ValueError:
+    print("Error: PROXY_PORT must be a number", file=sys.stderr)
+    sys.exit(1)
+MAX_CONTENT_SIZE = 1_000_000  # 1MB limit for accumulated stream content
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("codex-glm-proxy")
 
+# Model name mapping: OpenAI -> GLM
+MODEL_MAPPING = {
+    "glm-5.1": "glm-5.1",
+    "glm-5": "glm-5",
+    "gpt-4": "glm-4",
+    "gpt-4-turbo": "glm-4",
+    "gpt-4o": "glm-5",
+    "gpt-4o-mini": "glm-4-flash",
+    "gpt-3.5-turbo": "glm-4-flash",
+    "gpt-5.2-codex": "glm-5",
+    "gpt-5.3-codex": "glm-5",
+}
+
+
+# ---------------------------------------------------------------------------
+# Conversion: Responses API -> Chat Completions API
+# ---------------------------------------------------------------------------
 
 def convert_responses_to_chat(body: dict) -> dict:
-    """Convert Responses API format to Chat Completions API format."""
     chat_body = {}
 
-    # Model mapping
     model = body.get("model", "glm-5.1")
-    # Map OpenAI model names to GLM equivalents if needed
-    model_mapping = {
-        "glm-5.1": "glm-5.1",
-	    "glm-5": "glm-5",
-        "gpt-4": "glm-4",
-        "gpt-4-turbo": "glm-4",
-        "gpt-4o": "glm-5",  # Use glm-5 for best coding performance
-        "gpt-4o-mini": "glm-4-flash",
-        "gpt-3.5-turbo": "glm-4-flash",
-        "gpt-5.2-codex": "glm-5",
-        "gpt-5.3-codex": "glm-5",
-    }
-    chat_body["model"] = model_mapping.get(model, "glm-5.1")  # Default to glm-5
+    chat_body["model"] = MODEL_MAPPING.get(model, "glm-5.1")
 
     messages = []
 
-    # Convert instructions to system message
     if "instructions" in body and body["instructions"]:
         messages.append({"role": "system", "content": body["instructions"]})
 
-    # Convert input to messages
     if "input" in body:
         inp = body["input"]
         if isinstance(inp, str):
             messages.append({"role": "user", "content": inp})
         elif isinstance(inp, list):
-            # Responses API format: list of message objects
             for item in inp:
-                if isinstance(item, dict) and "type" in item:
-                    if item["type"] == "message":
-                        role = item.get("role", "user")
-                        # Map "developer" to "system" for GLM compatibility
-                        if role == "developer":
-                            role = "system"
-                        
-                        content = item.get("content", [])
-                        if isinstance(content, list):
-                            # Extract text from content blocks
-                            text_parts = []
-                            for c in content:
-                                if isinstance(c, dict):
-                                    if c.get("type") == "input_text":
-                                        text_parts.append(c.get("text", ""))
-                                    elif c.get("type") == "input_image":
-                                        # Skip images for now, or handle differently
-                                        pass
-                            if text_parts:
-                                messages.append({"role": role, "content": " ".join(text_parts)})
-                        elif isinstance(content, str):
-                            messages.append({"role": role, "content": content})
-                    
-                    elif item["type"] == "function_call":
-                        # This is a historical tool call from the model
-                        # Convert to assistant message with tool_calls
-                        call_id = item.get("call_id", item.get("id", ""))
-                        name = item.get("name", "")
-                        arguments = item.get("arguments", "{}")
-                        
-                        messages.append({
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [{
-                                "id": call_id,
-                                "type": "function",
-                                "function": {
-                                    "name": name,
-                                    "arguments": arguments
-                                }
-                            }]
-                        })
-                    
-                    elif item["type"] == "function_call_output":
-                        # This is the result of a tool call
-                        # Convert to tool message
-                        call_id = item.get("call_id", "")
-                        output = item.get("output", "")
-                        
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": output
-                        })
-                    
+                if not isinstance(item, dict) or "type" not in item:
+                    continue
+                if item["type"] == "message":
+                    role = item.get("role", "user")
+                    if role == "developer":
+                        role = "system"
+                    content = item.get("content", [])
+                    if isinstance(content, list):
+                        text_parts = []
+                        for c in content:
+                            if isinstance(c, dict):
+                                if c.get("type") == "input_text":
+                                    text_parts.append(c.get("text", ""))
+                        if text_parts:
+                            messages.append({"role": role, "content": " ".join(text_parts)})
+                    elif isinstance(content, str):
+                        messages.append({"role": role, "content": content})
+
+                elif item["type"] == "function_call":
+                    call_id = item.get("call_id", item.get("id", ""))
+                    messages.append({
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name", ""),
+                                "arguments": item.get("arguments", "{}"),
+                            }
+                        }]
+                    })
+
+                elif item["type"] == "function_call_output":
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": item.get("call_id", ""),
+                        "content": item.get("output", ""),
+                    })
+
         elif isinstance(inp, dict):
             if "messages" in inp:
                 for msg in inp["messages"]:
@@ -130,116 +117,81 @@ def convert_responses_to_chat(body: dict) -> dict:
 
     chat_body["messages"] = messages
 
-    # Pass through other fields
-    for key in ["temperature", "top_p", "max_tokens", "stream", "frequency_penalty", "presence_penalty", "stop"]:
+    for key in ("temperature", "top_p", "max_tokens", "stream", "frequency_penalty",
+                "presence_penalty", "stop"):
         if key in body:
             chat_body[key] = body[key]
 
-    # Handle tools - convert Responses API format to Chat Completions format
     if "tools" in body:
         chat_tools = []
         for tool in body["tools"]:
-            if isinstance(tool, dict):
-                tool_type = tool.get("type", "")
-                # Skip tools that GLM doesn't support
-                if tool_type in ["web_search", "code_interpreter", "file_search", "computer_use"]:
-                    log.info(f"Skipping unsupported tool type: {tool_type}")
-                    continue
-                    
-                # Responses API uses different tool format
-                if tool_type == "function":
-                    # Already in chat format
-                    if "function" in tool:
-                        chat_tools.append(tool)
-                    # Responses format - function definition is at top level
-                    else:
-                        chat_tool = {"type": "function", "function": {}}
-                        if "name" in tool:
-                            chat_tool["function"]["name"] = tool["name"]
-                        if "description" in tool:
-                            chat_tool["function"]["description"] = tool["description"]
-                        if "parameters" in tool:
-                            chat_tool["function"]["parameters"] = tool["parameters"]
-                        chat_tools.append(chat_tool)
+            if not isinstance(tool, dict):
+                continue
+            tool_type = tool.get("type", "")
+            if tool_type in ("web_search", "code_interpreter", "file_search", "computer_use"):
+                log.info("Skipping unsupported tool type: %s", tool_type)
+                continue
+            if tool_type == "function":
+                if "function" in tool:
+                    chat_tools.append(tool)
                 else:
-                    # Unknown format, try to pass through but only if function is present
-                    if "function" in tool:
-                        chat_tools.append(tool)
+                    chat_tool = {"type": "function", "function": {}}
+                    if "name" in tool:
+                        chat_tool["function"]["name"] = tool["name"]
+                    if "description" in tool:
+                        chat_tool["function"]["description"] = tool["description"]
+                    if "parameters" in tool:
+                        chat_tool["function"]["parameters"] = tool["parameters"]
+                    chat_tools.append(chat_tool)
+            elif "function" in tool:
+                chat_tools.append(tool)
         if chat_tools:
             chat_body["tools"] = chat_tools
-            log.info(f"Converted tools: {len(chat_tools)} tools (filtered from {len(body['tools'])})")
+            log.info("Converted tools: %d (from %d)", len(chat_tools), len(body["tools"]))
 
     if "tool_choice" in body:
         chat_body["tool_choice"] = body["tool_choice"]
 
-    # Handle reasoning/extended thinking
     if "reasoning" in body:
-        # GLM may not support this, but pass it through
         chat_body["reasoning"] = body["reasoning"]
 
     return chat_body
 
 
-def convert_chat_to_responses(response_body: dict, is_stream: bool) -> dict:
-    """Convert Chat Completions response back to Responses format."""
-    if is_stream:
-        # For streaming, the format is similar but with different event types
-        return response_body
+# ---------------------------------------------------------------------------
+# Conversion: Chat Completions -> Responses API (non-streaming)
+# ---------------------------------------------------------------------------
 
-    # Responses API format:
-    # {
-    #   "id": "resp_xxx",
-    #   "object": "response",
-    #   "output": [
-    #     {
-    #       "type": "message",
-    #       "id": "msg_xxx",
-    #       "status": "completed",
-    #       "role": "assistant",
-    #       "content": [
-    #         {"type": "output_text", "text": "..."}
-    #       ]
-    #     }
-    #   ],
-    #   "usage": {...}
-    # }
-    
+def convert_chat_to_responses(response_body: dict) -> dict:
     outputs = []
-    if "choices" in response_body:
-        for choice in response_body["choices"]:
-            msg = choice.get("message", {})
-            content_text = msg.get("content", "")
-            
-            # Build content array
-            content = []
-            if content_text:
-                content.append({
-                    "type": "output_text",
-                    "text": content_text
-                })
-            
-            # Handle tool calls
-            if "tool_calls" in msg:
-                for tc in msg["tool_calls"]:
-                    content.append({
-                        "type": "tool_call",
-                        "id": tc.get("id", ""),
-                        "call_id": tc.get("id", ""),
-                        "name": tc.get("function", {}).get("name", ""),
-                        "arguments": tc.get("function", {}).get("arguments", "{}")
-                    })
-            
-            output_item = {
-                "type": "message",
-                "id": f"msg_{response_body.get('id', '')}",
+    for choice in response_body.get("choices", []):
+        msg = choice.get("message", {})
+
+        # Message output with text content only
+        content = []
+        if msg.get("content"):
+            content.append({"type": "output_text", "text": msg["content"]})
+
+        outputs.append({
+            "type": "message",
+            "id": f"msg_{response_body.get('id', '')}",
+            "status": "completed",
+            "role": msg.get("role", "assistant"),
+            "content": content,
+        })
+
+        # Tool calls as separate output items (matches streaming behavior)
+        for tc in msg.get("tool_calls", []):
+            outputs.append({
+                "type": "function_call",
+                "id": f"fc_{tc.get('id', '')}",
+                "call_id": tc.get("id", ""),
+                "name": tc.get("function", {}).get("name", ""),
+                "arguments": tc.get("function", {}).get("arguments", "{}"),
                 "status": "completed",
-                "role": msg.get("role", "assistant"),
-                "content": content,
-            }
-            
-            outputs.append(output_item)
-    
-    responses_body = {
+            })
+
+    return {
         "id": response_body.get("id", ""),
         "object": "response",
         "created": response_body.get("created", 0),
@@ -249,512 +201,444 @@ def convert_chat_to_responses(response_body: dict, is_stream: bool) -> dict:
         "status": "completed",
     }
 
-    return responses_body
 
+# ---------------------------------------------------------------------------
+# Stream Converter: Chat Completions SSE -> Responses API SSE
+# ---------------------------------------------------------------------------
 
-def convert_stream_line(line: bytes) -> bytes:
-    """Convert a single SSE line from Chat to Responses format."""
-    if not line.startswith(b"data: "):
-        return line
+class StreamConverter:
+    """Stateful converter for one streaming request.
 
-    data = line[6:].strip()
-    if data == b"[DONE]":
-        return b"data: [DONE]\n\n"
+    Call process_line() for each raw SSE line from upstream.
+    Returns a list of bytes objects to write downstream.
+    """
 
-    try:
-        chunk = json.loads(data)
-
-        # Transform the chunk format
-        response_chunk = {
-            "id": chunk.get("id", ""),
-            "object": "response.chunk",
-            "created": chunk.get("created", 0),
-            "model": chunk.get("model", ""),
-            "output": []
-        }
-
-        if "choices" in chunk:
-            for choice in chunk["choices"]:
-                delta = choice.get("delta", {})
-                response_chunk["output"].append({
-                    "index": choice.get("index", 0),
-                    "delta": delta,
-                    "finish_reason": choice.get("finish_reason"),
-                })
-
-        return f"data: {json.dumps(response_chunk)}\n\n".encode()
-    except json.JSONDecodeError:
-        return line
-
-
-class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
-    """Thread-per-request HTTP server."""
-    daemon_threads = True
-    allow_reuse_address = True
-
-
-class ProxyHandler(http.server.BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def log_message(self, format, *args):
-        log.info(format, *args)
-
-    def do_GET(self):
-        """Handle health checks."""
-        if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok"}).encode())
-        elif self.path == "/v4/models" or self.path == "/v1/models":
-            self.forward_request("GET")
-        else:
-            self.send_response(404)
-            self.send_header("Connection", "close")
-            self.end_headers()
-
-    def do_POST(self):
-        """Handle POST requests - main proxy logic."""
-        if self.path.endswith("/responses"):
-            self.handle_responses()
-        elif self.path.endswith("/chat/completions"):
-            self.forward_request("POST")
-        else:
-            self.forward_request("POST")
-
-    def handle_responses(self):
-        """Convert Responses API to Chat Completions and proxy."""
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            body_data = self.rfile.read(content_length)
-            body = json.loads(body_data)
-
-            log.info(f"Raw request body: {json.dumps(body, ensure_ascii=False, indent=2)[:10000]}")
-
-            # Convert to Chat Completions format
-            chat_body = convert_responses_to_chat(body)
-            is_stream = body.get("stream", False)
-
-            log.info(f"Stream mode: {is_stream}")
-            log.info(f"Converted chat_body: {json.dumps(chat_body, ensure_ascii=False, indent=2)[:2000]}")
-
-            # Forward to GLM
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {GLM_API_KEY}",
-                "Accept": "text/event-stream" if is_stream else "application/json",
-            }
-            
-            # Use http.client for proper streaming support
-            url_parts = urllib.parse.urlparse(GLM_API_BASE)
-            conn = http.client.HTTPSConnection(url_parts.netloc, timeout=120)
-            
-            log.info(f"Forwarding to GLM: {GLM_API_BASE}/chat/completions (stream={is_stream})")
-            
-            try:
-                conn.request("POST", f"{url_parts.path}/chat/completions", 
-                            body=json.dumps(chat_body).encode(), headers=headers)
-                glm_resp = conn.getresponse()
-                
-                if is_stream:
-                    self.stream_response(glm_resp)
-                else:
-                    response_body = json.loads(glm_resp.read())
-                    log.info(f"GLM response: {json.dumps(response_body, ensure_ascii=False)[:2000]}")
-                    converted = convert_chat_to_responses(response_body, False)
-                    log.info(f"Converted response: {json.dumps(converted, ensure_ascii=False)[:2000]}")
-
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-                    self.wfile.write(json.dumps(converted).encode())
-            finally:
-                conn.close()
-
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode()
-            log.error(f"GLM API error: {e.code} - {error_body}")
-            self.send_response(e.code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(error_body.encode())
-
-        except Exception as e:
-            log.error(f"Proxy error: {e}")
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
-
-    def stream_response(self, glm_response):
-        """Handle streaming SSE response from GLM and convert to Responses format."""
-        # Reset state for this request
-        self.sequence_number = 0
+    def __init__(self):
+        self.seq = 0
         self.item_id = None
         self.response_id = None
         self.created_at = None
         self.model = None
         self.full_content = ""
-        self.content_part_id = None
-        self.tool_calls = {}  # Track tool calls by index
-        self.current_tool_index = 0
-        
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
-        
-        log.info("Starting streaming response...")
-        chunk_count = 0
+        self.tool_calls = {}
+        self._initialized = False
+        self._finished = False
 
-        try:
-            # Read line by line from GLM response
-            buffer = b""
-            while True:
-                chunk = glm_response.read(1)
-                if not chunk:
-                    break
-                    
-                buffer += chunk
-                if chunk == b"\n":
-                    line = buffer.strip()
-                    buffer = b""
-                    
-                    if not line:
-                        continue
-                    
-                    # Convert the line
-                    converted_lines = self.convert_stream_line(line)
-                    for converted in converted_lines:
-                        self.wfile.write(converted)
-                        self.wfile.flush()
-                        chunk_count += 1
-        
-            log.info(f"Streaming complete, sent {chunk_count} chunks")
-            
-        except Exception as e:
-            log.error(f"Streaming error: {e}")
+    def _next_seq(self):
+        s = self.seq
+        self.seq += 1
+        return s
 
-    def convert_stream_line(self, line: bytes) -> list:
-        """Convert a single SSE line from Chat Completions to Responses format.
-        
-        Returns a list of SSE lines to send.
-        """
-        results = []
-        
+    def process_line(self, line: bytes) -> list[bytes]:
         if not line.startswith(b"data: "):
             return [line + b"\n"]
 
         data = line[6:].strip()
         if data == b"[DONE]":
-            # Build output array for completed event
-            outputs = []
-            
-            # Add message output if there was content
-            if self.full_content and self.item_id:
-                outputs.append({
-                    "type": "message",
-                    "id": self.item_id,
-                    "status": "completed",
-                    "role": "assistant",
-                    "content": [{
-                        "type": "output_text",
-                        "text": self.full_content
-                    }]
-                })
-            
-            # Add function_call outputs
-            for tc_index, tc_data in self.tool_calls.items():
-                outputs.append({
-                    "type": "function_call",
-                    "id": f"fc_{tc_data['id']}",
-                    "call_id": tc_data["id"],
-                    "name": tc_data["name"],
-                    "arguments": tc_data["arguments"],
-                    "status": "completed"
-                })
-            
-            # Send response.completed event before DONE
-            if self.response_id:
-                completed_event = {
-                    "type": "response.completed",
-                    "sequence_number": self.sequence_number,
-                    "response": {
-                        "id": self.response_id,
-                        "object": "response",
-                        "created_at": self.created_at or 0,
-                        "model": self.model or "",
-                        "output": outputs,
-                        "status": "completed"
-                    }
-                }
-                self.sequence_number += 1
-                results.append(f"event: response.completed\ndata: {json.dumps(completed_event)}\n\n".encode())
-            
-            results.append(b"data: [DONE]\n\n")
-            return results
+            return self._on_done()
 
         try:
             chunk = json.loads(data)
-            
-            # Store response metadata from first chunk
-            if not self.item_id:
-                self.response_id = chunk.get("id", "")
-                # Ensure ID format matches OpenAI's format
-                if not self.response_id.startswith("resp_"):
-                    self.response_id = f"resp_{self.response_id}"
-                self.created_at = chunk.get("created", 0)
-                self.model = chunk.get("model", "")
-                self.item_id = f"msg_{self.response_id}"
-                self.content_part_id = f"cp_{self.response_id}"
-                
-                # Send response.created event
-                created_event = {
-                    "type": "response.created",
-                    "sequence_number": self.sequence_number,
-                    "response": {
-                        "id": self.response_id,
-                        "object": "response",
-                        "created_at": self.created_at,
-                        "model": self.model,
-                        "output": [],
-                        "status": "in_progress"
-                    }
-                }
-                self.sequence_number += 1
-                results.append(f"event: response.created\ndata: {json.dumps(created_event)}\n\n".encode())
-                
-                # Send output_item.added event
-                item_added_event = {
-                    "type": "response.output_item.added",
-                    "sequence_number": self.sequence_number,
-                    "output_index": 0,
-                    "item": {
-                        "type": "message",
-                        "id": self.item_id,
-                        "status": "in_progress",
-                        "role": "assistant",
-                        "content": []
-                    }
-                }
-                self.sequence_number += 1
-                results.append(f"event: response.output_item.added\ndata: {json.dumps(item_added_event)}\n\n".encode())
-                
-                # Send content_part.added event
-                content_part_event = {
-                    "type": "response.content_part.added",
-                    "sequence_number": self.sequence_number,
+        except json.JSONDecodeError:
+            return [line + b"\n"]
+
+        results = []
+
+        if not self._initialized:
+            self._initialized = True
+            self.response_id = chunk.get("id", "")
+            if not self.response_id.startswith("resp_"):
+                self.response_id = f"resp_{self.response_id}"
+            self.created_at = chunk.get("created", 0)
+            self.model = chunk.get("model", "")
+            self.item_id = f"msg_{self.response_id}"
+            results.extend(self._emit_init_events())
+
+        for choice in chunk.get("choices", []):
+            delta = choice.get("delta", {})
+            content = delta.get("content", "")
+            finish_reason = choice.get("finish_reason")
+
+            if content:
+                self.full_content += content
+                if len(self.full_content) > MAX_CONTENT_SIZE:
+                    self.full_content = self.full_content[-MAX_CONTENT_SIZE:]
+                results.append(self._sse("response.output_text.delta", {
+                    "type": "response.output_text.delta",
+                    "sequence_number": self._next_seq(),
                     "output_index": 0,
                     "content_index": 0,
                     "item_id": self.item_id,
-                    "content_part": {
-                        "type": "output_text",
-                        "text": ""
-                    }
-                }
-                self.sequence_number += 1
-                results.append(f"event: response.content_part.added\ndata: {json.dumps(content_part_event)}\n\n".encode())
+                    "delta": content,
+                    "logprobs": [],
+                }))
 
-            if "choices" in chunk:
-                for choice in chunk["choices"]:
-                    delta = choice.get("delta", {})
-                    content = delta.get("content", "")
-                    finish_reason = choice.get("finish_reason")
-                    
-                    if content:
-                        # Send response.output_text.delta event
-                        self.full_content += content
-                        delta_event = {
-                            "type": "response.output_text.delta",
-                            "sequence_number": self.sequence_number,
-                            "output_index": 0,
-                            "content_index": 0,
-                            "item_id": self.item_id,
-                            "delta": content,
-                            "logprobs": []  # Required field
-                        }
-                        self.sequence_number += 1
-                        results.append(f"event: response.output_text.delta\ndata: {json.dumps(delta_event)}\n\n".encode())
-                    
-                    # Handle tool calls in delta
-                    if "tool_calls" in delta:
-                        for tc in delta["tool_calls"]:
-                            tc_index = tc.get("index", 0)
-                            tc_id = tc.get("id", "")
-                            tc_function = tc.get("function", {})
-                            tc_name = tc_function.get("name", "")
-                            tc_args = tc_function.get("arguments", "")
-                            
-                            # If this is a new tool call, send output_item.added event
-                            if tc_index not in self.tool_calls:
-                                self.tool_calls[tc_index] = {
-                                    "id": tc_id,
-                                    "name": tc_name,
-                                    "arguments": ""
-                                }
-                                
-                                # Send function_call item added event
-                                tool_item_event = {
-                                    "type": "response.output_item.added",
-                                    "sequence_number": self.sequence_number,
-                                    "output_index": tc_index + 1,  # After text output
-                                    "item": {
-                                        "type": "function_call",
-                                        "id": f"fc_{tc_id}",
-                                        "call_id": tc_id,
-                                        "name": tc_name,
-                                        "arguments": "",
-                                        "status": "in_progress"
-                                    }
-                                }
-                                self.sequence_number += 1
-                                results.append(f"event: response.output_item.added\ndata: {json.dumps(tool_item_event)}\n\n".encode())
-                            
-                            # Send function_call_arguments.delta event
-                            if tc_args:
-                                self.tool_calls[tc_index]["arguments"] += tc_args
-                                tool_delta_event = {
-                                    "type": "response.function_call_arguments.delta",
-                                    "sequence_number": self.sequence_number,
-                                    "output_index": tc_index + 1,
-                                    "item_id": f"fc_{tc_id}",
-                                    "delta": tc_args,
-                                    "call_id": tc_id
-                                }
-                                self.sequence_number += 1
-                                results.append(f"event: response.function_call_arguments.delta\ndata: {json.dumps(tool_delta_event)}\n\n".encode())
-                    
-                    if finish_reason:
-                        # If there are tool calls, send done events for them
-                        if finish_reason == "tool_calls" and self.tool_calls:
-                            for tc_index, tc_data in self.tool_calls.items():
-                                tc_id = tc_data["id"]
-                                tc_name = tc_data["name"]
-                                tc_args = tc_data["arguments"]
-                                
-                                # Send function_call_arguments.done event
-                                tool_done_event = {
-                                    "type": "response.function_call_arguments.done",
-                                    "sequence_number": self.sequence_number,
-                                    "output_index": tc_index + 1,
-                                    "item_id": f"fc_{tc_id}",
-                                    "arguments": tc_args,
-                                    "call_id": tc_id
-                                }
-                                self.sequence_number += 1
-                                results.append(f"event: response.function_call_arguments.done\ndata: {json.dumps(tool_done_event)}\n\n".encode())
-                                
-                                # Send output_item.done for function_call
-                                tool_item_done = {
-                                    "type": "response.output_item.done",
-                                    "sequence_number": self.sequence_number,
-                                    "output_index": tc_index + 1,
-                                    "item": {
-                                        "type": "function_call",
-                                        "id": f"fc_{tc_id}",
-                                        "call_id": tc_id,
-                                        "name": tc_name,
-                                        "arguments": tc_args,
-                                        "status": "completed"
-                                    }
-                                }
-                                self.sequence_number += 1
-                                results.append(f"event: response.output_item.done\ndata: {json.dumps(tool_item_done)}\n\n".encode())
-                        
-                        # Send output_text.done event (if there was text content)
-                        if self.full_content:
-                            done_event = {
-                                "type": "response.output_text.done",
-                                "sequence_number": self.sequence_number,
-                                "output_index": 0,
-                                "content_index": 0,
-                                "item_id": self.item_id,
-                                "text": self.full_content
-                            }
-                            self.sequence_number += 1
-                            results.append(f"event: response.output_text.done\ndata: {json.dumps(done_event)}\n\n".encode())
-                            
-                            # Send content_part.done event
-                            content_done_event = {
-                                "type": "response.content_part.done",
-                                "sequence_number": self.sequence_number,
-                                "output_index": 0,
-                                "content_index": 0,
-                                "item_id": self.item_id,
-                                "content_part": {
-                                    "type": "output_text",
-                                    "text": self.full_content
-                                }
-                            }
-                            self.sequence_number += 1
-                            results.append(f"event: response.content_part.done\ndata: {json.dumps(content_done_event)}\n\n".encode())
-                        
-                        # Send output_item.done event for message
-                        if self.full_content:
-                            item_done_event = {
-                                "type": "response.output_item.done",
-                                "sequence_number": self.sequence_number,
-                                "output_index": 0,
-                                "item": {
-                                    "type": "message",
-                                    "id": self.item_id,
-                                    "status": "completed",
-                                    "role": "assistant",
-                                    "content": [{
-                                        "type": "output_text",
-                                        "text": self.full_content
-                                    }]
-                                }
-                            }
-                            self.sequence_number += 1
-                            results.append(f"event: response.output_item.done\ndata: {json.dumps(item_done_event)}\n\n".encode())
+            if "tool_calls" in delta:
+                results.extend(self._process_tool_calls(delta["tool_calls"]))
 
-            return results
-            
-        except json.JSONDecodeError as e:
-            log.error(f"Failed to parse chunk: {e}, line: {line}")
-            return [line + b"\n"]
+            if finish_reason and not self._finished:
+                self._finished = True
+                results.extend(self._on_finish())
 
-    def forward_request(self, method):
-        """Forward request directly without conversion."""
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length) if content_length > 0 else None
+        return results
 
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {GLM_API_KEY}",
-            }
+    # --- private helpers ---
 
-            path = self.path
-            if path.startswith("/v4/"):
-                path = path[3:]  # Remove /v4 prefix for GLM
+    @staticmethod
+    def _sse(event_type: str, data: dict) -> bytes:
+        return f"event: {event_type}\ndata: {json.dumps(data)}\n\n".encode()
 
-            req = urllib.request.Request(
-                f"{GLM_API_BASE}{path}",
-                data=body,
-                headers=headers,
-                method=method,
+    def _emit_init_events(self) -> list[bytes]:
+        return [
+            self._sse("response.created", {
+                "type": "response.created",
+                "sequence_number": self._next_seq(),
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": self.created_at,
+                    "model": self.model,
+                    "output": [],
+                    "status": "in_progress",
+                },
+            }),
+            self._sse("response.output_item.added", {
+                "type": "response.output_item.added",
+                "sequence_number": self._next_seq(),
+                "output_index": 0,
+                "item": {
+                    "type": "message",
+                    "id": self.item_id,
+                    "status": "in_progress",
+                    "role": "assistant",
+                    "content": [],
+                },
+            }),
+            self._sse("response.content_part.added", {
+                "type": "response.content_part.added",
+                "sequence_number": self._next_seq(),
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": self.item_id,
+                "content_part": {"type": "output_text", "text": ""},
+            }),
+        ]
+
+    def _process_tool_calls(self, tool_calls: list) -> list[bytes]:
+        results = []
+        for tc in tool_calls:
+            tc_index = tc.get("index", 0)
+            tc_id = tc.get("id", "")
+            tc_func = tc.get("function", {})
+            tc_name = tc_func.get("name", "")
+            tc_args = tc_func.get("arguments", "")
+
+            if tc_index not in self.tool_calls:
+                self.tool_calls[tc_index] = {"id": tc_id, "name": tc_name, "arguments": ""}
+                results.append(self._sse("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "sequence_number": self._next_seq(),
+                    "output_index": tc_index + 1,
+                    "item": {
+                        "type": "function_call",
+                        "id": f"fc_{tc_id}",
+                        "call_id": tc_id,
+                        "name": tc_name,
+                        "arguments": "",
+                        "status": "in_progress",
+                    },
+                }))
+
+            if tc_args:
+                self.tool_calls[tc_index]["arguments"] += tc_args
+                results.append(self._sse("response.function_call_arguments.delta", {
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": self._next_seq(),
+                    "output_index": tc_index + 1,
+                    "item_id": f"fc_{tc_id}",
+                    "delta": tc_args,
+                    "call_id": tc_id,
+                }))
+        return results
+
+    def _on_finish(self) -> list[bytes]:
+        results = []
+
+        # tool call done events
+        for tc_index, tc_data in self.tool_calls.items():
+            tc_id = tc_data["id"]
+            results.append(self._sse("response.function_call_arguments.done", {
+                "type": "response.function_call_arguments.done",
+                "sequence_number": self._next_seq(),
+                "output_index": tc_index + 1,
+                "item_id": f"fc_{tc_id}",
+                "arguments": tc_data["arguments"],
+                "call_id": tc_id,
+            }))
+            results.append(self._sse("response.output_item.done", {
+                "type": "response.output_item.done",
+                "sequence_number": self._next_seq(),
+                "output_index": tc_index + 1,
+                "item": {
+                    "type": "function_call",
+                    "id": f"fc_{tc_id}",
+                    "call_id": tc_id,
+                    "name": tc_data["name"],
+                    "arguments": tc_data["arguments"],
+                    "status": "completed",
+                },
+            }))
+
+        # text + message done events (always emit, even with empty content)
+        text = self.full_content
+        if text:
+            results.append(self._sse("response.output_text.done", {
+                "type": "response.output_text.done",
+                "sequence_number": self._next_seq(),
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": self.item_id,
+                "text": text,
+            }))
+            results.append(self._sse("response.content_part.done", {
+                "type": "response.content_part.done",
+                "sequence_number": self._next_seq(),
+                "output_index": 0,
+                "content_index": 0,
+                "item_id": self.item_id,
+                "content_part": {"type": "output_text", "text": text},
+            }))
+
+        results.append(self._sse("response.output_item.done", {
+            "type": "response.output_item.done",
+            "sequence_number": self._next_seq(),
+            "output_index": 0,
+            "item": {
+                "type": "message",
+                "id": self.item_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            },
+        }))
+
+        return results
+
+    def _on_done(self) -> list[bytes]:
+        results = []
+        outputs = []
+
+        # Always include message output
+        if self.item_id:
+            outputs.append({
+                "type": "message",
+                "id": self.item_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": self.full_content}],
+            })
+
+        for tc_index, tc_data in self.tool_calls.items():
+            outputs.append({
+                "type": "function_call",
+                "id": f"fc_{tc_data['id']}",
+                "call_id": tc_data["id"],
+                "name": tc_data["name"],
+                "arguments": tc_data["arguments"],
+                "status": "completed",
+            })
+
+        if self.response_id:
+            results.append(self._sse("response.completed", {
+                "type": "response.completed",
+                "sequence_number": self._next_seq(),
+                "response": {
+                    "id": self.response_id,
+                    "object": "response",
+                    "created_at": self.created_at or 0,
+                    "model": self.model or "",
+                    "output": outputs,
+                    "status": "completed",
+                },
+            }))
+
+        results.append(b"data: [DONE]\n\n")
+        return results
+
+
+# ---------------------------------------------------------------------------
+# HTTP Handlers
+# ---------------------------------------------------------------------------
+
+async def handle_health(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+
+async def handle_responses(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    chat_body = convert_responses_to_chat(body)
+    is_stream = body.get("stream", False)
+
+    log.info("Request: model=%s stream=%s tools=%d",
+             body.get("model"), is_stream, len(body.get("tools", [])))
+    log.debug("Converted body: %s", json.dumps(chat_body, ensure_ascii=False)[:2000])
+
+    session: aiohttp.ClientSession = request.app["session"]
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {GLM_API_KEY}",
+        "Accept": "text/event-stream" if is_stream else "application/json",
+    }
+
+    url = f"{GLM_API_BASE}/chat/completions"
+    log.info("Forwarding to: %s (stream=%s)", url, is_stream)
+
+    try:
+        async with session.post(url, json=chat_body, headers=headers) as resp:
+            if resp.status != 200:
+                error_body = await resp.text()
+                log.error("GLM API error: %d - %s", resp.status, error_body[:500])
+                return web.json_response(
+                    {"error": {"message": error_body, "type": "upstream_error", "code": resp.status}},
+                    status=resp.status,
+                )
+
+            if is_stream:
+                return await _stream_to_client(request, resp)
+
+            response_body = await resp.json()
+            log.debug("GLM response: %s", json.dumps(response_body, ensure_ascii=False)[:2000])
+            converted = convert_chat_to_responses(response_body)
+            return web.json_response(converted)
+
+    except asyncio.TimeoutError:
+        log.error("Upstream request timeout")
+        return web.json_response({"error": "upstream_timeout"}, status=504)
+    except aiohttp.ClientError as e:
+        log.error("Upstream connection error: %s", e)
+        return web.json_response({"error": str(e)}, status=502)
+
+
+async def _stream_to_client(request: web.Request, upstream: aiohttp.ClientResponse) -> web.StreamResponse:
+    downstream = web.StreamResponse(
+        status=200,
+        headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+    await downstream.prepare(request)
+
+    converter = StreamConverter()
+    chunk_count = 0
+
+    try:
+        while True:
+            line = await upstream.content.readline()
+            if not line:
+                break
+            if not line.strip():
+                continue
+            events = converter.process_line(line)
+            for event_bytes in events:
+                try:
+                    await downstream.write(event_bytes)
+                except (ConnectionResetError, ConnectionError):
+                    log.warning("Client disconnected during streaming")
+                    return downstream
+            chunk_count += 1
+    except Exception as e:
+        log.error("Streaming error: %s", e)
+
+    log.info("Streaming complete: %d chunks, model=%s", chunk_count, converter.model)
+    return downstream
+
+
+async def handle_forward(request: web.Request) -> web.Response:
+    session: aiohttp.ClientSession = request.app["session"]
+    path = request.path
+    if path.startswith("/v4/"):
+        path = path[3:]
+    elif path.startswith("/v1/"):
+        path = path[3:]
+
+    url = f"{GLM_API_BASE}{path}"
+    headers = {
+        "Content-Type": request.content_type or "application/json",
+        "Authorization": f"Bearer {GLM_API_KEY}",
+    }
+
+    body = await request.read()
+
+    try:
+        async with session.request(request.method, url, data=body, headers=headers) as resp:
+            content_type = resp.headers.get("Content-Type", "application/json")
+
+            if "text/event-stream" in content_type:
+                downstream = web.StreamResponse(
+                    status=resp.status,
+                    headers={"Content-Type": content_type},
+                )
+                await downstream.prepare(request)
+                async for chunk in resp.content.iter_any():
+                    await downstream.write(chunk)
+                return downstream
+
+            resp_body = await resp.read()
+            return web.Response(
+                body=resp_body,
+                status=resp.status,
+                content_type=content_type,
             )
+    except asyncio.TimeoutError:
+        return web.json_response({"error": "upstream_timeout"}, status=504)
+    except aiohttp.ClientError as e:
+        log.error("Forward error: %s", e)
+        return web.json_response({"error": str(e)}, status=502)
 
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                response_body = resp.read()
-                self.send_response(200)
-                self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
-                self.end_headers()
-                self.wfile.write(response_body)
 
-        except Exception as e:
-            log.error(f"Forward error: {e}")
-            self.send_response(500)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+# ---------------------------------------------------------------------------
+# Application Factory
+# ---------------------------------------------------------------------------
+
+async def on_startup(app: web.Application):
+    connector = aiohttp.TCPConnector(
+        limit=100,
+        limit_per_host=20,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
+    timeout = aiohttp.ClientTimeout(total=120, connect=10, sock_read=60)
+    app["session"] = aiohttp.ClientSession(connector=connector, timeout=timeout)
+    log.info("Connection pool initialized")
+
+
+async def on_shutdown(app: web.Application):
+    log.info("Shutting down, closing connections...")
+    await app["session"].close()
+    log.info("Done")
+
+
+def create_app() -> web.Application:
+    app = web.Application(client_max_size=10 * 1024 * 1024)  # 10MB
+
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+
+    app.router.add_get("/health", handle_health)
+    app.router.add_post("/v4/responses", handle_responses)
+    app.router.add_post("/v4/chat/completions", handle_forward)
+    app.router.add_get("/v4/models", handle_forward)
+    app.router.add_get("/v1/models", handle_forward)
+    app.router.add_post("/v1/chat/completions", handle_forward)
+    app.router.add_post("/{path:.*}", handle_forward)
+
+    return app
 
 
 def main():
@@ -762,14 +646,10 @@ def main():
         log.error("GLM_API_KEY environment variable is required")
         sys.exit(1)
 
-    with ThreadingHTTPServer(("", PROXY_PORT), ProxyHandler) as httpd:
-        log.info(f"Codex-GLM proxy running on port {PROXY_PORT}")
-        log.info(f"GLM API base: {GLM_API_BASE}")
-        log.info("Press Ctrl+C to stop")
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            log.info("Shutting down...")
+    app = create_app()
+    log.info("Codex-GLM proxy starting on port %d", PROXY_PORT)
+    log.info("GLM API base: %s", GLM_API_BASE)
+    web.run_app(app, host="0.0.0.0", port=PROXY_PORT, print=None, access_log=None)
 
 
 if __name__ == "__main__":
