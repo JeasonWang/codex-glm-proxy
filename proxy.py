@@ -34,10 +34,11 @@ def convert_responses_to_chat(body: dict) -> dict:
     chat_body = {}
 
     # Model mapping
-    model = body.get("model", "gpt-4")
+    model = body.get("model", "glm-5.1")
     # Map OpenAI model names to GLM equivalents if needed
     model_mapping = {
-	"glm-5": "glm-5",
+        "glm-5.1": "glm-5.1",
+	    "glm-5": "glm-5",
         "gpt-4": "glm-4",
         "gpt-4-turbo": "glm-4",
         "gpt-4o": "glm-5",  # Use glm-5 for best coding performance
@@ -46,7 +47,7 @@ def convert_responses_to_chat(body: dict) -> dict:
         "gpt-5.2-codex": "glm-5",
         "gpt-5.3-codex": "glm-5",
     }
-    chat_body["model"] = model_mapping.get(model, "glm-5")  # Default to glm-5
+    chat_body["model"] = model_mapping.get(model, "glm-5.1")  # Default to glm-5
 
     messages = []
 

@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_FILE="/tmp/codex-glm-proxy.log"
 PID_FILE="/tmp/codex-glm-proxy.pid"
 
+echo "SCRIPT_DIR: $SCRIPT_DIR"
+
 # Check if already running
 if [ -f "$PID_FILE" ]; then
     PID=$(cat "$PID_FILE")
@@ -23,13 +25,13 @@ fi
 
 # Start proxy
 echo "Starting Codex GLM Proxy..."
-nohup python3 "$SCRIPT_DIR/proxy.py" > "$LOG_FILE" 2>&1 &
+nohup python3 "$SCRIPT_DIR/../proxy.py" > "$LOG_FILE" 2>&1 &
 PID=$!
 echo $PID > "$PID_FILE"
 sleep 1
 
 # Verify
-if curl -s http://localhost:8765/health > /dev/null 2>&1; then
+if curl -s http://localhost:18765/health > /dev/null 2>&1; then
     echo "✓ Proxy started successfully (PID: $PID)"
     echo "  Health check: http://localhost:8765/health"
     echo "  Log file: $LOG_FILE"
