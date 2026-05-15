@@ -55,3 +55,5 @@ Thumbs.db
 *.sqlite3
 *.pid
 codex-glm-proxy.log
+codex-glm-proxy.pid
+com.codex-glm-proxy.plist

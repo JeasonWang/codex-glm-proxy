@@ -15,10 +15,16 @@ if [ -f "$PID_FILE" ]; then
     fi
 fi
 
+# Load .env if exists and GLM_API_KEY not already set
+if [ -z "$GLM_API_KEY" ] && [ -f "$PROJECT_DIR/.env" ]; then
+    export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs)
+fi
+
 # Check for API key
 if [ -z "$GLM_API_KEY" ]; then
-    echo "Error: GLM_API_KEY environment variable is not set"
-    echo "Please run: export GLM_API_KEY='your_api_key'"
+    echo "Error: GLM_API_KEY not found"
+    echo "Set it via: export GLM_API_KEY='your_api_key'"
+    echo "Or create: $PROJECT_DIR/.env"
     exit 1
 fi
 
