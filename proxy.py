@@ -37,13 +37,17 @@ log = logging.getLogger("codex-glm-proxy")
 MODEL_MAPPING = {
     "glm-5.1": "glm-5.1",
     "glm-5": "glm-5",
-    "gpt-4": "glm-4",
-    "gpt-4-turbo": "glm-4",
-    "gpt-4o": "glm-5",
-    "gpt-4o-mini": "glm-4-flash",
-    "gpt-3.5-turbo": "glm-4-flash",
-    "gpt-5.2-codex": "glm-5",
-    "gpt-5.3-codex": "glm-5",
+    "glm-5-turbo": "glm-5-turbo",
+    "gpt-4": "glm-5.1",
+    "gpt-4-turbo": "glm-5.1",
+    "gpt-4o": "glm-5.1",
+    "gpt-4o-mini": "glm-5.1",
+    "gpt-3.5-turbo": "glm-5.1",
+    "gpt-5.2-codex": "glm-5.1",
+    "gpt-5.3-codex": "glm-5.1",
+    "gpt-5.4-mini": "glm-5.1",
+    "gpt-5.4-codex": "glm-5.1",
+    "gpt-5.5": "glm-5.1",
 }
 
 
