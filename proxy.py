@@ -39,6 +39,7 @@ MODEL_MAPPING = {
     "glm-5": "glm-5",
     "glm-5-turbo": "glm-5-turbo",
     "gpt-4": "glm-5.1",
+    "glm-4-flash": "glm-5.1",
     "gpt-4-turbo": "glm-5.1",
     "gpt-4o": "glm-5.1",
     "gpt-4o-mini": "glm-5.1",
@@ -130,7 +131,8 @@ def convert_responses_to_chat(body: dict) -> dict:
     chat_body["messages"] = messages
 
     for key in ("temperature", "top_p", "max_tokens",
-                "stream", "frequency_penalty", "presence_penalty", "stop"):
+                "stream", "frequency_penalty", "presence_penalty", "stop",
+                "parallel_tool_calls"):
         if key in body:
             chat_body[key] = body[key]
 
@@ -717,8 +719,13 @@ def _convert_tools(tools: list, ctx: _ToolContext | None = None) -> list[dict] |
             continue
         tool_type = tool.get("type", "")
 
-        # Skip server-side-only tools
-        if tool_type in ("web_search", "code_interpreter", "file_search", "computer_use",
+        # GLM web_search tool
+        if tool_type == "web_search":
+            out.append({"type": "web_search", "web_search": {"enable": True, "search_result": True}})
+            continue
+
+        # Skip server-side-only tools not supported by GLM
+        if tool_type in ("code_interpreter", "file_search", "computer_use",
                          "image_generation", "computer_use_preview", "web_search_preview"):
             continue
 
@@ -1087,7 +1094,8 @@ class StreamConverter:
         resp_obj.setdefault("truncation", "disabled")
         resp_obj.setdefault("tool_choice", "auto")
         resp_obj.setdefault("text", {"format": {"type": "text"}})
-        resp_obj.setdefault("reasoning", {"effort": None, "summary": None})
+        # GLM-5.x always thinks — tell Codex to render the thinking section
+        resp_obj.setdefault("reasoning", {"effort": "high", "summary": "auto"})
         if usage is not None:
             resp_obj["usage"] = usage
         # incomplete_details
