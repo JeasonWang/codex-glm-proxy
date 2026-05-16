@@ -141,17 +141,81 @@ def convert_responses_to_chat(body: dict) -> dict:
         chat_body["stream_options"] = {"include_usage": True}
 
     if "tools" in body:
-        chat_tools = _convert_tools(body["tools"])
+        tool_ctx = _build_tool_context(body["tools"])
+        chat_tools = _convert_tools(body["tools"], tool_ctx)
         if chat_tools:
             chat_body["tools"] = chat_tools
+        # Store tool context on the body for later response-side use
+        body["_tool_ctx"] = tool_ctx
 
     if "tool_choice" in body:
         chat_body["tool_choice"] = body["tool_choice"]
 
-    if "reasoning" in body:
-        chat_body["reasoning"] = body["reasoning"]
+    # Map reasoning.effort → reasoning_effort
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        effort = reasoning["effort"]
+        effort_map = {
+            "none": "none", "auto": "auto", "minimal": "low",
+            "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh",
+        }
+        chat_body["reasoning_effort"] = effort_map.get(effort, "auto")
+
+    # Passthrough user field
+    if "user" in body:
+        chat_body["user"] = body["user"]
 
     return chat_body
+
+
+def _remove_orphan_tool_messages(messages: list):
+    """Remove {role: tool} messages that have no preceding assistant.tool_calls."""
+    valid_ids: set[str] | None = None
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") == "assistant":
+            tcs = m.get("tool_calls", [])
+            valid_ids = {tc["id"] for tc in tcs if tc.get("id")} if tcs else None
+            i += 1
+        elif m.get("role") == "tool":
+            if valid_ids and m.get("tool_call_id") and m["tool_call_id"] in valid_ids:
+                i += 1
+            else:
+                log.warning("Dropping orphan tool message: tool_call_id=%s", m.get("tool_call_id"))
+                messages.pop(i)
+        else:
+            valid_ids = None
+            i += 1
+
+
+def _ensure_tool_calls_have_outputs(messages: list):
+    """Ensure every assistant message with tool_calls has a matching tool output."""
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if m.get("role") != "assistant" or not m.get("tool_calls"):
+            i += 1
+            continue
+        seen = set()
+        j = i + 1
+        while j < len(messages) and messages[j].get("role") == "tool":
+            tcid = messages[j].get("tool_call_id")
+            if tcid:
+                seen.add(tcid)
+            j += 1
+        missing = [tc["id"] for tc in m["tool_calls"] if tc.get("id") and tc["id"] not in seen]
+        if missing:
+            placeholders = [
+                {"role": "tool", "tool_call_id": tid,
+                 "content": "[tool output missing — no function_call_output was provided for this call_id]"}
+                for tid in missing
+            ]
+            for k, ph in enumerate(placeholders):
+                messages.insert(j + k, ph)
+            i = j + len(placeholders)
+        else:
+            i += 1
 
 
 def _convert_input_list(items: list, messages: list):
@@ -160,13 +224,21 @@ def _convert_input_list(items: list, messages: list):
     Key challenge: In Responses API, an assistant turn with both text and tool_calls
     appears as separate items (message + function_call), but Chat Completions needs
     them merged into a single assistant message with tool_calls.
+
+    Codex pattern: function_call → function_call → message(assistant) →
+    function_call_output → function_call_output. The assistant text message must be
+    merged with the preceding tool_calls into one assistant message.
     """
     pending_assistant = None
     pending_tc: list[dict] = []
+    pending_reasoning: list[str] = []
 
     def flush_assistant():
         nonlocal pending_assistant
         if pending_assistant:
+            if pending_reasoning:
+                pending_assistant["reasoning_content"] = "\n".join(pending_reasoning)
+                pending_reasoning.clear()
             messages.append(pending_assistant)
             pending_assistant = None
 
@@ -174,12 +246,15 @@ def _convert_input_list(items: list, messages: list):
         nonlocal pending_tc
         if not pending_tc:
             return
-        # Look up stored reasoning by tool_call IDs
         rc = ""
-        for tc in pending_tc:
-            rc = _reasoning_store.get(f"tc_{tc['id']}", "")
-            if rc:
-                break
+        if pending_reasoning:
+            rc = "\n".join(pending_reasoning)
+            pending_reasoning.clear()
+        else:
+            for tc in pending_tc:
+                rc = _reasoning_store.get(f"tc_{tc['id']}", "")
+                if rc:
+                    break
         msg = {"role": "assistant", "content": None, "tool_calls": list(pending_tc)}
         if rc:
             msg["reasoning_content"] = rc
@@ -190,6 +265,8 @@ def _convert_input_list(items: list, messages: list):
         if isinstance(item, str):
             flush_assistant()
             flush_tool_calls()
+            if pending_reasoning:
+                pending_reasoning.clear()
             messages.append({"role": "user", "content": item})
             continue
         if not isinstance(item, dict):
@@ -213,6 +290,9 @@ def _convert_input_list(items: list, messages: list):
                 if pending_tc:
                     pending_assistant["tool_calls"] = list(pending_tc)
                     pending_tc = []
+                if pending_reasoning:
+                    pending_assistant["reasoning_content"] = "\n".join(pending_reasoning)
+                    pending_reasoning.clear()
                 messages.append(pending_assistant)
                 pending_assistant = None
             else:
@@ -228,9 +308,77 @@ def _convert_input_list(items: list, messages: list):
             })
 
         else:
-            # message or unknown type — flush any pending tool calls first
+            # message, reasoning, custom_tool_call, custom_tool_call_output, text, or unknown
             flush_assistant()
-            flush_tool_calls()
+
+            item_type = item.get("type", "")
+
+            # Accumulate reasoning — merge into next assistant message (ccx pattern)
+            if item_type == "reasoning":
+                reasoning_text = ""
+                enc = item.get("encrypted_content")
+                if isinstance(enc, str) and enc:
+                    reasoning_text = enc
+                else:
+                    summary = item.get("summary", [])
+                    if isinstance(summary, list):
+                        reasoning_text = "\n".join(
+                            s.get("text", "") for s in summary
+                            if isinstance(s, dict) and s.get("type") == "summary_text"
+                        )
+                if reasoning_text:
+                    pending_reasoning.append(reasoning_text)
+                continue
+
+            # Support custom_tool_call → assistant with tool_calls
+            if item_type == "custom_tool_call":
+                flush_tool_calls()
+                call_id = item.get("call_id", item.get("id", ""))
+                name = item.get("name", "")
+                input_text = item.get("input", item.get("arguments", ""))
+                if name:
+                    tc = {
+                        "id": call_id or name,
+                        "type": "function",
+                        "function": {"name": name, "arguments": input_text},
+                    }
+                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                continue
+
+            # Support custom_tool_call_output → tool message
+            if item_type == "custom_tool_call_output":
+                flush_tool_calls()
+                call_id = item.get("call_id", item.get("id", ""))
+                output = item.get("output", "")
+                if isinstance(output, list):
+                    output = _extract_text(output)
+                messages.append({"role": "tool", "tool_call_id": call_id, "content": str(output)})
+                continue
+
+            # Handle items without explicit type but with role (legacy compatibility)
+            role = item.get("role", "")
+            if not item_type and role:
+                item_type = "message"
+
+            # Support "text" type (old format)
+            if item_type == "text":
+                flush_tool_calls()
+                role = role or "assistant"
+                content = item.get("content", "")
+                if isinstance(content, list):
+                    content = _extract_text(content)
+                if role == "developer":
+                    role = "system"
+                msg = {"role": role}
+                if content is not None:
+                    msg["content"] = content
+                if msg.get("content") is not None:
+                    messages.append(msg)
+                continue
+
+            if item_type != "message":
+                flush_tool_calls()
+                continue
 
             role = item.get("role", "user")
             if role == "developer":
@@ -242,48 +390,397 @@ def _convert_input_list(items: list, messages: list):
             if content is not None:
                 msg["content"] = content
 
-            # For assistant messages, restore reasoning_content and hold for possible merge
+            # For assistant messages, hold for possible merge with pending tool_calls
+            # (Codex pattern: function_call → message(assistant) → function_call_output)
             if role == "assistant":
                 stored_rc = _lookup_reasoning(content or "")
                 if stored_rc:
                     msg["reasoning_content"] = stored_rc
+                elif pending_reasoning:
+                    msg["reasoning_content"] = "\n".join(pending_reasoning)
+                    pending_reasoning.clear()
                 msg.setdefault("content", None)
+                # DON'T flush tool_calls — function_call_output will merge them
                 pending_assistant = msg
                 continue
 
+            # Non-assistant messages: flush tool_calls first
+            flush_tool_calls()
+            if pending_reasoning:
+                pending_reasoning.clear()
             if msg.get("content") is not None:
                 messages.append(msg)
 
     # Flush any remaining
     if pending_assistant and pending_tc:
         pending_assistant["tool_calls"] = list(pending_tc)
+        if pending_reasoning:
+            pending_assistant["reasoning_content"] = "\n".join(pending_reasoning)
+            pending_reasoning.clear()
         messages.append(pending_assistant)
     else:
         flush_assistant()
         flush_tool_calls()
 
+    # Remove orphan tool messages and ensure all tool_calls have outputs
+    _remove_orphan_tool_messages(messages)
+    _ensure_tool_calls_have_outputs(messages)
 
-def _convert_tools(tools: list) -> list[dict] | None:
-    """Convert Responses API tools to Chat Completions tools format."""
-    out = []
+
+def _normalize_tool_params(params: dict | None) -> dict:
+    """Ensure tool parameters have type, properties, and required fields."""
+    if not params or not isinstance(params, dict):
+        params = {}
+    params.setdefault("type", "object")
+    params.setdefault("properties", {})
+    params.setdefault("required", [])
+    return params
+
+
+# ---------------------------------------------------------------------------
+# Codex Custom Tool Compatibility
+# ---------------------------------------------------------------------------
+
+# local_shell builtin → standard shell function tool
+_LOCAL_SHELL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "shell",
+        "description": "Execute a shell command on the local machine.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Argv array, e.g. [\"ls\", \"-la\"].",
+                },
+                "workdir": {"type": "string", "description": "Working directory."},
+                "timeout_ms": {"type": "number", "description": "Timeout in milliseconds."},
+            },
+            "required": ["command"],
+        },
+    },
+}
+
+
+def _is_apply_patch_tool(tool: dict) -> bool:
+    """Check if a tool is Codex's apply_patch custom tool."""
+    if tool.get("type") != "custom":
+        return False
+    name = tool.get("name", "")
+    if name == "apply_patch":
+        return True
+    fmt = tool.get("format", {})
+    if isinstance(fmt, dict):
+        grammar = fmt.get("definition", "")
+        if isinstance(grammar, str) and "begin_patch" in grammar and "end_patch" in grammar:
+            return True
+    return False
+
+
+def _apply_patch_proxy_tools(name: str, description: str = "") -> list[dict]:
+    """Generate 5 proxy function tools for apply_patch."""
+    base_desc = description or "Edit files using structured patch operations."
+    tools = []
+    for action, desc, schema in [
+        ("_add_file", "Create a new file.",
+         {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Target file path."},
+             "content": {"type": "string", "description": "Full file content."}},
+          "required": ["path", "content"]}),
+        ("_delete_file", "Delete a file.",
+         {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Target file path."}},
+          "required": ["path"]}),
+        ("_update_file", "Edit an existing file with hunks.",
+         {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Target file path."},
+             "hunks": {"type": "array", "items": {
+                 "type": "object", "properties": {
+                     "lines": {"type": "array", "items": {
+                         "type": "object", "properties": {
+                             "op": {"type": "string", "enum": ["context", "add", "remove"]},
+                             "text": {"type": "string"}},
+                          "required": ["op", "text"]}}},
+                  "required": ["lines"]}}},
+          "required": ["path", "hunks"]}),
+        ("_replace_file", "Replace a file entirely.",
+         {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Target file path."},
+             "content": {"type": "string", "description": "Full replacement content."}},
+          "required": ["path", "content"]}),
+        ("_batch", "Edit multiple files in one operation.",
+         {"type": "object", "properties": {
+             "operations": {"type": "array", "items": {
+                 "type": "object", "properties": {
+                     "type": {"type": "string", "enum": ["add_file", "delete_file", "update_file", "replace_file"]},
+                     "path": {"type": "string"},
+                     "content": {"type": "string"},
+                     "hunks": {"type": "array"}},
+                  "required": ["type", "path"]}}},
+          "required": ["operations"]}),
+    ]:
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": f"{name}{action}",
+                "description": f"{base_desc} (proxy: {action[1:]})" if base_desc else desc,
+                "parameters": schema,
+            },
+        })
+    return tools
+
+
+def _reconstruct_apply_patch_input(name: str, action: str, raw_args: str) -> str:
+    """Reconstruct apply_patch grammar text from proxy tool arguments."""
+    try:
+        args = json.loads(raw_args)
+    except (json.JSONDecodeError, TypeError):
+        return raw_args
+
+    parts = ["*** Begin Patch\n"]
+
+    if action == "add_file":
+        parts.append(f"*** Add File: {args.get('path', '')}\n")
+        content = args.get("content", "")
+        for line in content.rstrip("\n").split("\n"):
+            parts.append(f"+{line}\n")
+    elif action == "delete_file":
+        parts.append(f"*** Delete File: {args.get('path', '')}\n")
+    elif action == "update_file":
+        parts.append(f"*** Update File: {args.get('path', '')}\n")
+        for hunk in args.get("hunks", []):
+            parts.append("@@\n")
+            for line in hunk.get("lines", []):
+                op = line.get("op", "context")
+                text = line.get("text", "")
+                prefix = {"context": " ", "add": "+", "remove": "-"}.get(op, " ")
+                parts.append(f"{prefix}{text}\n")
+    elif action == "replace_file":
+        parts.append(f"*** Delete File: {args.get('path', '')}\n")
+        parts.append(f"*** Add File: {args.get('path', '')}\n")
+        content = args.get("content", "")
+        for line in content.rstrip("\n").split("\n"):
+            parts.append(f"+{line}\n")
+    elif action == "batch":
+        for op in args.get("operations", []):
+            op_type = op.get("type", "")
+            path = op.get("path", "")
+            if op_type == "add_file":
+                parts.append(f"*** Add File: {path}\n")
+                for line in op.get("content", "").rstrip("\n").split("\n"):
+                    parts.append(f"+{line}\n")
+            elif op_type == "delete_file":
+                parts.append(f"*** Delete File: {path}\n")
+            elif op_type == "update_file":
+                parts.append(f"*** Update File: {path}\n")
+                for hunk in op.get("hunks", []):
+                    parts.append("@@\n")
+                    for line in hunk.get("lines", []):
+                        o = line.get("op", "context")
+                        prefix = {"context": " ", "add": "+", "remove": "-"}.get(o, " ")
+                        parts.append(f"{prefix}{line.get('text', '')}\n")
+            elif op_type == "replace_file":
+                parts.append(f"*** Delete File: {path}\n")
+                parts.append(f"*** Add File: {path}\n")
+                for line in op.get("content", "").rstrip("\n").split("\n"):
+                    parts.append(f"+{line}\n")
+    else:
+        return raw_args
+
+    parts.append("*** End Patch")
+    return "".join(parts)
+
+
+def _is_apply_patch_proxy(name: str) -> tuple[bool, str]:
+    """Check if function name is an apply_patch proxy. Returns (is_proxy, action)."""
+    for suffix in ("_add_file", "_delete_file", "_update_file", "_replace_file", "_batch"):
+        if name.endswith(suffix):
+            return True, suffix[1:]  # strip leading _
+    return False, ""
+
+
+def _generic_custom_tool(name: str, description: str = "") -> dict:
+    """Convert a custom tool to a generic function tool with {input: string}."""
+    desc = description or f"Custom tool: {name}. Put the tool input text here."
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": desc,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input": {"type": "string", "description": "Raw input for this tool."},
+                },
+                "required": ["input"],
+            },
+        },
+    }
+
+
+def _flatten_namespace_tool(namespace: str, name: str) -> str:
+    """Flatten namespace + tool name into a single function name."""
+    if not namespace:
+        return name
+    sep = "" if namespace.endswith("__") or name.startswith("__") else "__"
+    return f"{namespace}{sep}{name}"
+
+
+class _ToolContext:
+    """Track tool metadata for request/response conversion."""
+
+    def __init__(self):
+        self.apply_patch_names: set[str] = set()  # original apply_patch tool names
+        self.custom_tools: dict[str, str] = {}     # proxy_name → original_name
+        self.namespace_tools: dict[str, tuple[str, str]] = {}  # flat_name → (namespace, name)
+
+    def is_custom_proxy(self, name: str) -> bool:
+        return name in self.custom_tools
+
+    def original_name(self, name: str) -> str:
+        return self.custom_tools.get(name, name)
+
+    def unflatten_namespace(self, name: str) -> tuple[str, str]:
+        """Return (name, namespace) for a flat function name."""
+        if name in self.namespace_tools:
+            return self.namespace_tools[name]
+        return name, ""
+
+    def reconstruct_input(self, name: str, raw_args: str) -> str:
+        """Reconstruct custom tool input from proxy arguments."""
+        if name in self.apply_patch_names:
+            is_proxy, action = _is_apply_patch_proxy(name)
+            if is_proxy:
+                return _reconstruct_apply_patch_input(name, action, raw_args)
+            # Direct apply_patch call
+            try:
+                args = json.loads(raw_args)
+                if isinstance(args, dict) and "input" in args:
+                    return args["input"]
+            except (json.JSONDecodeError, TypeError):
+                pass
+            return raw_args
+        # Generic custom tool
+        try:
+            args = json.loads(raw_args)
+            if isinstance(args, dict) and "input" in args:
+                return args["input"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return raw_args
+
+
+def _build_tool_context(tools: list) -> _ToolContext:
+    """Build tool context from Responses API tools list."""
+    ctx = _ToolContext()
     for tool in tools:
         if not isinstance(tool, dict):
             continue
         tool_type = tool.get("type", "")
-        if tool_type in ("web_search", "code_interpreter", "file_search", "computer_use"):
+        name = tool.get("name", "")
+
+        if tool_type == "custom":
+            if _is_apply_patch_tool(tool):
+                ctx.apply_patch_names.add(name)
+                for suffix in ("_add_file", "_delete_file", "_update_file", "_replace_file", "_batch"):
+                    proxy_name = f"{name}{suffix}"
+                    ctx.custom_tools[proxy_name] = name
+                ctx.custom_tools[name] = name
+            else:
+                ctx.custom_tools[name] = name
+        elif tool_type == "namespace":
+            namespace = name
+            children = tool.get("tools", [])
+            for child in children:
+                if isinstance(child, dict) and child.get("type") == "function":
+                    child_name = child.get("name", "")
+                    if child_name:
+                        flat = _flatten_namespace_tool(namespace, child_name)
+                        ctx.namespace_tools[flat] = (child_name, namespace)
+    return ctx
+
+
+def _convert_tools(tools: list, ctx: _ToolContext | None = None) -> list[dict] | None:
+    """Convert Responses API tools to Chat Completions tools format."""
+    ctx = ctx or _ToolContext()
+    out = []
+    seen_apply_patch: set[str] = set()
+
+    for tool in tools:
+        if not isinstance(tool, dict):
             continue
+        tool_type = tool.get("type", "")
+
+        # Skip server-side-only tools
+        if tool_type in ("web_search", "code_interpreter", "file_search", "computer_use",
+                         "image_generation", "computer_use_preview", "web_search_preview"):
+            continue
+
+        # Standard function tool
         if tool_type == "function":
             if "function" in tool:
-                out.append(tool)
+                func_def = tool["function"]
+                func = {"name": func_def.get("name", "")}
+                if func_def.get("description"):
+                    func["description"] = func_def["description"]
+                func["parameters"] = _normalize_tool_params(func_def.get("parameters"))
+                if isinstance(func_def.get("strict"), bool):
+                    func["strict"] = func_def["strict"]
+                out.append({"type": "function", "function": func})
             else:
                 func = {"name": tool.get("name", "")}
                 if tool.get("description"):
                     func["description"] = tool["description"]
-                if tool.get("parameters"):
-                    func["parameters"] = tool["parameters"]
+                func["parameters"] = _normalize_tool_params(tool.get("parameters"))
+                if isinstance(tool.get("strict"), bool):
+                    func["strict"] = tool["strict"]
                 out.append({"type": "function", "function": func})
-        elif "function" in tool:
+            continue
+
+        # local_shell → shell function tool
+        if tool_type == "local_shell":
+            out.append(_LOCAL_SHELL_TOOL)
+            continue
+
+        # custom tool (apply_patch → 5 proxies, else generic)
+        if tool_type == "custom":
+            name = tool.get("name", "")
+            description = tool.get("description", "")
+            if _is_apply_patch_tool(tool) and name not in seen_apply_patch:
+                seen_apply_patch.add(name)
+                out.extend(_apply_patch_proxy_tools(name, description))
+            else:
+                out.append(_generic_custom_tool(name, description))
+            continue
+
+        # namespace → flatten child function tools
+        if tool_type == "namespace":
+            namespace = tool.get("name", "")
+            children = tool.get("tools", [])
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                if child.get("type") == "function":
+                    child_name = child.get("name", "")
+                    if not child_name:
+                        continue
+                    flat = _flatten_namespace_tool(namespace, child_name)
+                    func = {"name": flat}
+                    child_desc = child.get("description", "")
+                    ns_desc = tool.get("description", "")
+                    combined = f"{ns_desc}\n\n{child_desc}".strip() if ns_desc and child_desc else child_desc or ns_desc
+                    if combined:
+                        func["description"] = combined
+                    func["parameters"] = _normalize_tool_params(child.get("parameters"))
+                    out.append({"type": "function", "function": func})
+            continue
+
+        # Unknown tool types that have a function key — pass through
+        if "function" in tool:
             out.append(tool)
+
     return out or None
 
 
@@ -338,17 +835,44 @@ def convert_chat_to_responses(response_body: dict, body: dict | None = None) -> 
 
         # Tool calls as separate output items
         tc_ids = []
+        tool_ctx: _ToolContext | None = body.get("_tool_ctx") if isinstance(body, dict) else None
         for tc in msg.get("tool_calls", []):
             tc_id = tc.get("id", "")
             tc_ids.append(tc_id)
-            outputs.append({
+            tc_name = tc.get("function", {}).get("name", "")
+            tc_args = tc.get("function", {}).get("arguments", "{}")
+
+            # Reconstruct custom tool input if applicable
+            if tool_ctx and tool_ctx.is_custom_proxy(tc_name):
+                reconstructed = tool_ctx.reconstruct_input(tc_name, tc_args)
+                original = tool_ctx.original_name(tc_name)
+                outputs.append({
+                    "type": "custom_tool_call",
+                    "id": f"ctc_{tc_id}",
+                    "call_id": tc_id,
+                    "name": original,
+                    "input": reconstructed,
+                    "status": "completed",
+                })
+                continue
+
+            # Unflatten namespace tools
+            display_name = tc_name
+            namespace = ""
+            if tool_ctx:
+                display_name, namespace = tool_ctx.unflatten_namespace(tc_name)
+
+            item = {
                 "type": "function_call",
                 "id": f"fc_{tc_id}",
                 "call_id": tc_id,
-                "name": tc.get("function", {}).get("name", ""),
-                "arguments": tc.get("function", {}).get("arguments", "{}"),
+                "name": display_name,
+                "arguments": tc_args,
                 "status": "completed",
-            })
+            }
+            if namespace:
+                item["namespace"] = namespace
+            outputs.append(item)
 
         # Store reasoning for multi-turn
         _store_reasoning(content_text, reasoning, tc_ids)
@@ -388,7 +912,7 @@ def convert_chat_to_responses(response_body: dict, body: dict | None = None) -> 
         "truncation": "disabled",
         "tool_choice": body.get("tool_choice", "auto"),
         "text": body.get("text", {"format": {"type": "text"}}),
-        "reasoning": body.get("reasoning", {"effort": None, "summary": None}),
+        "reasoning": {"effort": "high", "summary": "auto"} if reasoning else body.get("reasoning", {"effort": None, "summary": None}),
     }
 
     # Echo back request-level fields
@@ -431,6 +955,7 @@ class StreamConverter:
         self._usage = None
         self._finish_reason = None
         self._body = body or {}
+        self._tool_ctx: _ToolContext | None = (body or {}).get("_tool_ctx")
 
     def _next_seq(self):
         s = self.seq
@@ -781,39 +1306,114 @@ class StreamConverter:
 
     def _on_finish(self) -> list[bytes]:
         results = []
-        # Close reasoning block
         if self._reasoning_active:
             results.extend(self._close_reasoning_block())
-        # Close text block
         if self._text_active:
             results.extend(self._close_text_block())
-        # Close tool call blocks
         for tc_index in sorted(self.tool_calls.keys()):
-            tc_data = self.tool_calls[tc_index]
-            tc_id = tc_data["id"]
-            output_index = self._tool_output_index(tc_index)
+            results.extend(self._build_tool_call_done_events(tc_index, self.tool_calls[tc_index]))
+        return results
+
+    def _build_tool_call_done_events(self, tc_index: int, tc_data: dict) -> list[bytes]:
+        """Build done events for a single tool call, handling custom/namespace remapping."""
+        results = []
+        tc_id = tc_data["id"]
+        tc_name = tc_data["name"]
+        tc_args = tc_data["arguments"]
+        output_index = self._tool_output_index(tc_index)
+
+        if self._tool_ctx and self._tool_ctx.is_custom_proxy(tc_name):
+            reconstructed = self._tool_ctx.reconstruct_input(tc_name, tc_args)
+            original = self._tool_ctx.original_name(tc_name)
+            item_id = f"ctc_{tc_id}"
+            # custom_tool_call_input.delta
+            results.append(self._sse("response.custom_tool_call_input.delta", {
+                "type": "response.custom_tool_call_input.delta",
+                "sequence_number": self._next_seq(),
+                "output_index": output_index,
+                "item_id": item_id,
+                "call_id": tc_id,
+                "delta": reconstructed,
+            }))
+            # output_item.done for custom_tool_call
+            results.append(self._sse("response.output_item.done", {
+                "type": "response.output_item.done",
+                "sequence_number": self._next_seq(),
+                "output_index": output_index,
+                "item": {
+                    "id": item_id,
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "call_id": tc_id,
+                    "name": original,
+                    "input": reconstructed,
+                },
+            }))
+        else:
+            display_name = tc_name
+            namespace = ""
+            if self._tool_ctx:
+                display_name, namespace = self._tool_ctx.unflatten_namespace(tc_name)
+            # function_call_arguments.done
             results.append(self._sse("response.function_call_arguments.done", {
                 "type": "response.function_call_arguments.done",
                 "sequence_number": self._next_seq(),
                 "output_index": output_index,
                 "item_id": f"fc_{tc_id}",
                 "call_id": tc_id,
-                "arguments": tc_data["arguments"],
+                "arguments": tc_args,
             }))
+            item = {
+                "type": "function_call",
+                "id": f"fc_{tc_id}",
+                "call_id": tc_id,
+                "name": display_name,
+                "arguments": tc_args,
+                "status": "completed",
+            }
+            if namespace:
+                item["namespace"] = namespace
             results.append(self._sse("response.output_item.done", {
                 "type": "response.output_item.done",
                 "sequence_number": self._next_seq(),
                 "output_index": output_index,
-                "item": {
-                    "type": "function_call",
-                    "id": f"fc_{tc_id}",
-                    "call_id": tc_id,
-                    "name": tc_data["name"],
-                    "arguments": tc_data["arguments"],
-                    "status": "completed",
-                },
+                "item": item,
             }))
         return results
+
+    def _build_tool_call_output_item(self, tc_data: dict) -> dict:
+        """Build output item dict for response.completed's output array."""
+        tc_id = tc_data["id"]
+        tc_name = tc_data["name"]
+        tc_args = tc_data["arguments"]
+
+        if self._tool_ctx and self._tool_ctx.is_custom_proxy(tc_name):
+            reconstructed = self._tool_ctx.reconstruct_input(tc_name, tc_args)
+            original = self._tool_ctx.original_name(tc_name)
+            return {
+                "type": "custom_tool_call",
+                "id": f"ctc_{tc_id}",
+                "call_id": tc_id,
+                "name": original,
+                "input": reconstructed,
+                "status": "completed",
+            }
+
+        display_name = tc_name
+        namespace = ""
+        if self._tool_ctx:
+            display_name, namespace = self._tool_ctx.unflatten_namespace(tc_name)
+        item = {
+            "type": "function_call",
+            "id": f"fc_{tc_id}",
+            "call_id": tc_id,
+            "name": display_name,
+            "arguments": tc_args,
+            "status": "completed",
+        }
+        if namespace:
+            item["namespace"] = namespace
+        return item
 
     def _on_done(self) -> list[bytes]:
         results = []
@@ -834,34 +1434,10 @@ class StreamConverter:
         # Close any tool call blocks not yet closed
         if not self._finished:
             for tc_index in sorted(self.tool_calls.keys()):
-                tc_data = self.tool_calls[tc_index]
-                tc_id = tc_data["id"]
-                output_index = self._tool_output_index(tc_index)
-                results.append(self._sse("response.function_call_arguments.done", {
-                    "type": "response.function_call_arguments.done",
-                    "sequence_number": self._next_seq(),
-                    "output_index": output_index,
-                    "item_id": f"fc_{tc_id}",
-                    "call_id": tc_id,
-                    "arguments": tc_data["arguments"],
-                }))
-                results.append(self._sse("response.output_item.done", {
-                    "type": "response.output_item.done",
-                    "sequence_number": self._next_seq(),
-                    "output_index": output_index,
-                    "item": {
-                        "type": "function_call",
-                        "id": f"fc_{tc_id}",
-                        "call_id": tc_id,
-                        "name": tc_data["name"],
-                        "arguments": tc_data["arguments"],
-                        "status": "completed",
-                    },
-                }))
+                results.extend(self._build_tool_call_done_events(tc_index, self.tool_calls[tc_index]))
 
         # Build final output array for response.completed
         outputs = []
-        # Reasoning item
         if self.full_reasoning or self._reasoning_part_added:
             outputs.append({
                 "id": self.reasoning_item_id,
@@ -870,7 +1446,6 @@ class StreamConverter:
                 "summary": [{"type": "summary_text", "text": self.full_reasoning}],
                 "encrypted_content": self.full_reasoning,
             })
-        # Message item
         if self.item_id:
             outputs.append({
                 "type": "message",
@@ -879,17 +1454,8 @@ class StreamConverter:
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": self.full_content, "annotations": []}],
             })
-        # Function call items
         for tc_index in sorted(self.tool_calls.keys()):
-            tc_data = self.tool_calls[tc_index]
-            outputs.append({
-                "type": "function_call",
-                "id": f"fc_{tc_data['id']}",
-                "call_id": tc_data["id"],
-                "name": tc_data["name"],
-                "arguments": tc_data["arguments"],
-                "status": "completed",
-            })
+            outputs.append(self._build_tool_call_output_item(self.tool_calls[tc_index]))
 
         # Store reasoning for multi-turn restoration
         tc_ids = [self.tool_calls[i]["id"] for i in sorted(self.tool_calls.keys())] if self.tool_calls else None
@@ -902,6 +1468,9 @@ class StreamConverter:
 
         if self.response_id:
             resp_obj = self._build_envelope(status, outputs, _normalize_usage(self._usage))
+            # If reasoning was generated, set proper effort so Codex displays it
+            if self.full_reasoning:
+                resp_obj["reasoning"] = {"effort": "high", "summary": "auto"}
             results.append(self._sse("response.completed", {
                 "type": "response.completed",
                 "sequence_number": self._next_seq(),
@@ -929,8 +1498,11 @@ async def handle_responses(request: web.Request) -> web.Response:
     chat_body = convert_responses_to_chat(body)
     is_stream = body.get("stream", False)
 
-    log.info("Request: model=%s stream=%s tools=%d",
-             body.get("model"), is_stream, len(body.get("tools", [])))
+    log.info("Request: model=%s stream=%s tools=%d reasoning=%s",
+             body.get("model"), is_stream, len(body.get("tools", [])), body.get("reasoning"))
+    # Save request for debugging
+    with open(os.path.join(os.path.dirname(__file__), "last_request.json"), "w") as f:
+        json.dump(body, f, ensure_ascii=False, indent=2, default=str)
     log.debug("Converted body: %s", json.dumps(chat_body, ensure_ascii=False)[:2000])
 
     session: aiohttp.ClientSession = request.app["session"]
@@ -983,6 +1555,7 @@ async def _stream_to_client(request: web.Request, upstream: aiohttp.ClientRespon
 
     converter = StreamConverter(body=req_body)
     chunk_count = 0
+    completed = False
 
     try:
         while True:
@@ -998,9 +1571,25 @@ async def _stream_to_client(request: web.Request, upstream: aiohttp.ClientRespon
                 except (ConnectionResetError, ConnectionError):
                     log.warning("Client disconnected during streaming")
                     return downstream
+            # Check if converter sent its own [DONE]
+            if events and events[-1] == b"data: [DONE]\n\n":
+                completed = True
+                break
             chunk_count += 1
     except Exception as e:
         log.error("Streaming error: %s", e)
+
+    # Synthesize response.completed if upstream stream ended abnormally
+    if not completed:
+        try:
+            synth = converter._on_done()
+            for event_bytes in synth:
+                try:
+                    await downstream.write(event_bytes)
+                except (ConnectionResetError, ConnectionError):
+                    break
+        except Exception as e:
+            log.error("Failed to synthesize completion: %s", e)
 
     log.info("Streaming complete: %d chunks, model=%s", chunk_count, converter.model)
     return downstream
