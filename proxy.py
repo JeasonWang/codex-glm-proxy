@@ -1512,9 +1512,9 @@ async def handle_responses(request: web.Request) -> web.Response:
 
     log.info("Request: model=%s stream=%s tools=%d reasoning=%s",
              body.get("model"), is_stream, len(body.get("tools", [])), body.get("reasoning"))
-    # Save request for debugging，下面这个语句可能会有编码问题，最好指定utf-8
-    # with open(os.path.join(os.path.dirname(__file__), "last_request.json"), "w") as f:
-    #     json.dump(body, f, ensure_ascii=False, indent=2, default=str)
+    # Save request for debugging
+    # with open(os.path.join(os.path.dirname(__file__), "last_request.json"), "w", encoding="utf-8") as f:
+    #     1517 - json.dump(body, f, ensure_ascii=False, indent=2, default=str)
     log.debug("Converted body: %s", json.dumps(chat_body, ensure_ascii=False)[:2000])
 
     session: aiohttp.ClientSession = request.app["session"]
