@@ -1680,6 +1680,9 @@ def create_app() -> web.Application:
 
     app.router.add_get("/health", handle_health)
     app.router.add_post("/v4/responses", handle_responses)
+    app.router.add_post("/v4/responses/compact", handle_responses)
+    app.router.add_post("/v1/responses", handle_responses)
+    app.router.add_post("/v1/responses/compact", handle_responses)
     app.router.add_post("/v4/chat/completions", handle_forward)
     app.router.add_get("/v4/models", handle_forward)
     app.router.add_get("/v1/models", handle_forward)
