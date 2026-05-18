@@ -38,6 +38,7 @@ MODEL_MAPPING = {
     "glm-5.1": "glm-5.1",
     "glm-5": "glm-5",
     "glm-5-turbo": "glm-5-turbo",
+    "glm-4.7": "glm-4.7",
     "gpt-4": "glm-5.1",
     "glm-4-flash": "glm-5.1",
     "gpt-4-turbo": "glm-5.1",
